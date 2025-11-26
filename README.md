@@ -1,1 +1,0 @@
-# sgtu-event-v4
