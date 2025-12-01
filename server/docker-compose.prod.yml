@@ -1,0 +1,218 @@
+# Production Docker Compose Configuration
+# Production-ready with security, monitoring, and high availability
+# Uses external Neon DB and Redis Cloud
+
+services:
+  # Main Application Server (Production)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        - NODE_ENV=production
+    image: sgtu-event-server:${VERSION:-latest}
+    container_name: sgtu-event-server-prod
+    restart: always
+    ports:
+      - "${APP_PORT:-5000}:5000"
+    environment:
+      # System Configuration
+      NODE_ENV: production
+      PORT: 5000
+      TZ: Asia/Kolkata
+      NODE_OPTIONS: "--max-old-space-size=512 --max-http-header-size=16384"
+      
+      # External Services (from .env)
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_USERNAME: ${REDIS_USERNAME:-default}
+      REDIS_DB: ${REDIS_DB:-0}
+      
+      # JWT Configuration
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      
+      # Rate Limiting (production values)
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
+      
+      # File Upload
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-10485760}
+      UPLOAD_DIR: uploads
+      
+      # Email Configuration
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      
+      # CORS
+      CLIENT_URL: ${CLIENT_URL}
+      
+      # Admin
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    
+    volumes:
+      # Named volumes for persistence
+      - uploads:/app/uploads:rw
+      - logs:/app/logs:rw
+    
+    networks:
+      - sgtu-network
+    
+    # Health monitoring
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    
+    # Production resource limits and restart policies
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        monitor: 60s
+    
+    # Structured logging with rotation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+        labels: "service,environment"
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    
+    # Read-only root filesystem (except writable volumes)
+    read_only: false
+    
+    # Limit container capabilities
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    
+    # DNS configuration
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    
+    # Labels for monitoring
+    labels:
+      - "com.sgtu.service=event-management-api"
+      - "com.sgtu.environment=production"
+      - "com.sgtu.version=${VERSION:-latest}"
+
+  # Nginx Reverse Proxy with SSL/TLS
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: sgtu-event-nginx
+    restart: always
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-cache:/var/cache/nginx:rw
+      - nginx-logs:/var/log/nginx:rw
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - sgtu-network
+    
+    # Health check for nginx
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    
+    # Resource limits for nginx
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+    
+    # Security
+    security_opt:
+      - no-new-privileges:true
+    
+    # Labels
+    labels:
+      - "com.sgtu.service=reverse-proxy"
+      - "com.sgtu.environment=production"
+
+volumes:
+  uploads:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${UPLOAD_PATH:-./data/uploads}
+  logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${LOG_PATH:-./data/logs}
+  nginx-cache:
+    driver: local
+  nginx-logs:
+    driver: local
+
+networks:
+  sgtu-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: sgtu-bridge
+      com.docker.network.bridge.enable_ip_masquerade: "true"
