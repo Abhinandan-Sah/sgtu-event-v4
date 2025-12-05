@@ -47,7 +47,7 @@ app.get('/api', (req, res) => {
       feedback: '/api/feedback',
       ranking: '/api/ranking',
       checkInOut: '/api/check-in-out',
-      eventManagers: '/api/event-managers' // ✅ Fixed: plural form
+      eventManagers: '/api/event-managers' 
     }
   });
 });
