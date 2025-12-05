@@ -1,5 +1,5 @@
 // EventVolunteer Model - Junction table for event-volunteer assignments
-import { query } from '../config/db.js';
+import { query, pool } from '../config/db.js';
 
 class EventVolunteer {
   /**

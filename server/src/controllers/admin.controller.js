@@ -2,6 +2,7 @@ import Admin from '../models/Admin.model.js';
 import Student from '../models/Student.model.js';
 import Volunteer from '../models/Volunteer.model.js';
 import Stall from '../models/Stall.model.js';
+import School from '../models/School.model.js';
 import CheckInOut from '../models/CheckInOut.model.js';
 import EventManagerModel from '../models/EventManager.model.js'; // ✅ Fixed: consistent naming
 import EventModel from '../models/Event.model.js'; // ✅ Fixed: consistent naming
@@ -966,16 +967,18 @@ const getEventApprovalPreview = async (req, res, next) => {
     const volunteersResult = await query(`
       SELECT 
         v.id,
-        v.volunteer_name,
+        v.full_name,
         v.email,
         v.phone,
-        v.assigned_location,
+        v.role,
         v.is_active,
+        ev.assigned_location,
+        ev.permissions,
         ev.assigned_at
       FROM volunteers v
       INNER JOIN event_volunteers ev ON v.id = ev.volunteer_id
-      WHERE ev.event_id = $1
-      ORDER BY v.volunteer_name ASC
+      WHERE ev.event_id = $1 AND ev.is_active = true
+      ORDER BY v.full_name ASC
     `, [id]);
 
     return successResponse(res, {
@@ -1237,6 +1240,23 @@ const getEventAnalytics = async (req, res, next) => {
   }
 };
 
+/**
+ * Get all schools
+ * @route GET /api/admin/schools
+ */
+const getAllSchools = async (req, res, next) => {
+  try {
+    const schools = await School.findAll(query);
+
+    return successResponse(res, {
+      schools,
+      total: schools.length
+    }, 'Schools retrieved successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
 export default {
   login,
   logout,
@@ -1245,6 +1265,7 @@ export default {
   getAllStudents,
   getAllVolunteers,
   getAllStalls,
+  getAllSchools,
   getStats,
   getTopSchools,
   getTopStalls,

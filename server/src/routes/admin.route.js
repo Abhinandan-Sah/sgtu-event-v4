@@ -25,6 +25,9 @@ router.get('/volunteers', adminController.getAllVolunteers);
 router.get('/stalls', adminController.getAllStalls);
 router.get('/stats', adminController.getStats);
 
+// School management
+router.get('/schools', adminController.getAllSchools);
+
 // School ranking results (Category 2 - ADMIN ONLY)
 router.get('/top-schools', adminController.getTopSchools);
 router.get('/top-stalls', adminController.getTopStalls);

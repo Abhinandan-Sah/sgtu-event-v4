@@ -3,6 +3,7 @@ import { query } from '../config/db.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { successResponse, errorResponse, validationErrorResponse } from '../helpers/response.js';
+import School from '../models/School.model.js';
 import { setAuthCookie, clearAuthCookie } from '../helpers/cookie.js';
 import {
   EventManagerModel,
@@ -414,7 +415,61 @@ class EventManagerController {
       // Get event stats
       const stats = await EventModel.getStats(eventId);
 
-      return successResponse(res, { event, stats });
+      // Get all volunteers for this event
+      const volunteers = await query(`
+        SELECT 
+          v.id,
+          v.full_name,
+          v.email,
+          v.phone,
+          v.role,
+          v.is_active,
+          v.total_scans_performed,
+          ev.assigned_location,
+          ev.permissions,
+          ev.total_scans_for_event,
+          ev.assigned_at
+        FROM volunteers v
+        INNER JOIN event_volunteers ev ON v.id = ev.volunteer_id
+        WHERE ev.event_id = $1 AND ev.is_active = true
+        ORDER BY v.full_name ASC
+      `, [eventId]);
+
+      // Get all stalls for this event
+      const stalls = await query(`
+        SELECT 
+          st.id,
+          st.stall_name,
+          st.stall_number,
+          st.location,
+          st.description,
+          st.is_active,
+          st.qr_code_token,
+          st.rank_1_votes,
+          st.rank_2_votes,
+          st.rank_3_votes,
+          st.weighted_score,
+          st.total_feedback_count,
+          sc.school_name
+        FROM stalls st
+        LEFT JOIN schools sc ON st.school_id = sc.id
+        WHERE st.event_id = $1
+        ORDER BY st.stall_number ASC
+      `, [eventId]);
+
+      return successResponse(res, { 
+        event, 
+        stats,
+        volunteers: {
+          data: volunteers,
+          total: volunteers.length
+        },
+        stalls: {
+          data: stalls,
+          total: stalls.length,
+          active: stalls.filter(s => s.is_active).length
+        }
+      });
     } catch (error) {
       console.error('Get event details error:', error);
       return errorResponse(res, error.message, 500);
@@ -898,6 +953,24 @@ class EventManagerController {
       });
     } catch (error) {
       console.error('Get event analytics error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Get all schools
+   * GET /api/event-manager/schools
+   */
+  static async getAllSchools(req, res) {
+    try {
+      const schools = await School.findAll(query);
+
+      return successResponse(res, {
+        schools,
+        total: schools.length
+      }, 'Schools retrieved successfully');
+    } catch (error) {
+      console.error('Get schools error:', error);
       return errorResponse(res, error.message, 500);
     }
   }

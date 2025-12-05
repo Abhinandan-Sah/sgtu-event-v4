@@ -107,7 +107,6 @@ app.listen(PORT, () => {
     console.log(`📡 API available at http://localhost:${PORT}/api`);
     console.log(`💚 Health check at http://localhost:${PORT}/health`);
     console.log(`🎓 SGT University Event Management System`);
-    console.log(`👥 Ready for 11,000+ students | 200+ stalls`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🔗 CORS allowed from: ${process.env.CLIENT_URL || 'http://localhost:3000'}`);
   }

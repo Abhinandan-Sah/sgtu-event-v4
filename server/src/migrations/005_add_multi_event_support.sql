@@ -92,7 +92,6 @@ CREATE TABLE IF NOT EXISTS events (
     
     -- Permissions and visibility
     is_visible BOOLEAN DEFAULT TRUE,
-    requires_approval BOOLEAN DEFAULT TRUE, -- Requires admin approval before going live
     
     -- Analytics (cached counters)
     total_registrations INTEGER DEFAULT 0,

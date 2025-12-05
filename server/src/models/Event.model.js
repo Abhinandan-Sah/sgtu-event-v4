@@ -28,8 +28,7 @@ class Event {
       refund_policy = null,
       refund_enabled = false,
       banner_image_url = null,
-      event_images = [],
-      requires_approval = true
+      event_images = []
     } = eventData;
 
     // Validation
@@ -54,7 +53,6 @@ class Event {
         refund_policy, refund_enabled,
         banner_image_url, event_images,
         created_by_manager_id,
-        requires_approval,
         status
       )
       VALUES (
@@ -65,8 +63,7 @@ class Event {
         ${refund_policy}, ${refund_enabled},
         ${banner_image_url}, ${event_images},
         ${managerId},
-        ${requires_approval},
-        ${requires_approval ? 'PENDING_APPROVAL' : 'APPROVED'}
+        'DRAFT'
       )
       RETURNING *
     `;
@@ -122,7 +119,8 @@ class Event {
       'start_date', 'end_date', 'registration_start_date', 'registration_end_date',
       'max_capacity', 'waitlist_enabled', 'is_visible',
       'refund_policy', 'refund_enabled',
-      'banner_image_url', 'event_images'
+      'banner_image_url', 'event_images',
+      'status', 'admin_rejection_reason'
     ];
 
     const updateFields = {};
@@ -479,8 +477,9 @@ class Event {
          e.event_category, e.tags, e.venue,
          e.start_date, e.end_date,
          e.registration_start_date, e.registration_end_date,
-         e.max_capacity, e.current_registrations,
-         e.status, e.banner_image_url,
+         e.max_capacity, e.current_registrations, e.waitlist_enabled,
+         e.status, e.banner_image_url, e.event_images,
+         e.refund_policy, e.refund_enabled,
          (e.max_capacity IS NOT NULL AND e.current_registrations >= e.max_capacity) as is_full,
          COUNT(*) OVER() as total_count
        FROM events e
@@ -527,14 +526,15 @@ class Event {
   static async getStats(eventId) {
     const result = await pool`
       SELECT 
-        e.*,
         COUNT(DISTINCT er.id) FILTER (WHERE er.registration_status = 'CONFIRMED') as confirmed_registrations,
         COUNT(DISTINCT er.id) FILTER (WHERE er.registration_status = 'WAITLISTED') as waitlisted_registrations,
         COUNT(DISTINCT er.id) FILTER (WHERE er.has_checked_in = TRUE) as total_check_ins,
-        COUNT(DISTINCT ev.volunteer_id) as volunteers_assigned
+        COUNT(DISTINCT ev.volunteer_id) FILTER (WHERE ev.is_active = TRUE) as volunteers_assigned,
+        COUNT(DISTINCT s.id) as stalls_assigned
       FROM events e
       LEFT JOIN event_registrations er ON e.id = er.event_id
       LEFT JOIN event_volunteers ev ON e.id = ev.event_id
+      LEFT JOIN stalls s ON e.id = s.event_id
       WHERE e.id = ${eventId}
       GROUP BY e.id
     `;

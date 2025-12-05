@@ -59,6 +59,13 @@ router.get('/profile', EventManagerController.getProfile);
  */
 router.put('/profile', EventManagerController.updateProfile);
 
+/**
+ * @route   GET /api/event-manager/schools
+ * @desc    Get all schools (for stall/volunteer creation)
+ * @access  Private (EVENT_MANAGER)
+ */
+router.get('/schools', EventManagerController.getAllSchools);
+
 // ============================================================
 // EVENT MANAGEMENT ROUTES
 // ============================================================
