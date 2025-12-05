@@ -244,9 +244,9 @@ const scanStall = async (req, res, next) => {
 
     // Get current event from active check-in
     const activeCheckInResult = await query(
-      `SELECT event_id FROM check_in_out 
-       WHERE student_id = $1 AND check_type = 'CHECK_IN' 
-       ORDER BY check_time DESC LIMIT 1`,
+      `SELECT event_id FROM check_in_outs 
+       WHERE student_id = $1 AND scan_type = 'CHECKIN' 
+       ORDER BY scanned_at DESC LIMIT 1`,
       [req.user.id]
     );
 
@@ -323,9 +323,9 @@ const submitFeedback = async (req, res, next) => {
 
     // Get current event from active check-in
     const activeCheckInResult = await query(
-      `SELECT event_id FROM check_in_out 
-       WHERE student_id = $1 AND check_type = 'CHECK_IN' 
-       ORDER BY check_time DESC LIMIT 1`,
+      `SELECT event_id FROM check_in_outs 
+       WHERE student_id = $1 AND scan_type = 'CHECKIN' 
+       ORDER BY scanned_at DESC LIMIT 1`,
       [req.user.id]
     );
 
@@ -416,9 +416,9 @@ const getMyVisits = async (req, res, next) => {
     // Get current event stats if checked in
     let currentEventStats = null;
     const activeCheckInResult = await query(
-      `SELECT event_id FROM check_in_out 
-       WHERE student_id = $1 AND check_type = 'CHECK_IN' 
-       ORDER BY check_time DESC LIMIT 1`,
+      `SELECT event_id FROM check_in_outs 
+       WHERE student_id = $1 AND scan_type = 'CHECKIN' 
+       ORDER BY scanned_at DESC LIMIT 1`,
       [req.user.id]
     );
 
@@ -476,9 +476,9 @@ const getMySchoolStalls = async (req, res, next) => {
 
     // Get current event from active check-in
     const activeCheckInResult = await query(
-      `SELECT event_id FROM check_in_out 
-       WHERE student_id = $1 AND check_type = 'CHECK_IN' 
-       ORDER BY check_time DESC LIMIT 1`,
+      `SELECT event_id FROM check_in_outs 
+       WHERE student_id = $1 AND scan_type = 'CHECKIN' 
+       ORDER BY scanned_at DESC LIMIT 1`,
       [req.user.id]
     );
 
@@ -590,9 +590,9 @@ const submitSchoolRanking = async (req, res, next) => {
 
     // Get current event from active check-in
     const activeCheckInResult = await query(
-      `SELECT event_id FROM check_in_out 
-       WHERE student_id = $1 AND check_type = 'CHECK_IN' 
-       ORDER BY check_time DESC LIMIT 1`,
+      `SELECT event_id FROM check_in_outs 
+       WHERE student_id = $1 AND scan_type = 'CHECKIN' 
+       ORDER BY scanned_at DESC LIMIT 1`,
       [req.user.id]
     );
 
@@ -748,9 +748,9 @@ const getMySchoolRanking = async (req, res, next) => {
 
     // Get current event from active check-in
     const activeCheckInResult = await query(
-      `SELECT event_id FROM check_in_out 
-       WHERE student_id = $1 AND check_type = 'CHECK_IN' 
-       ORDER BY check_time DESC LIMIT 1`,
+      `SELECT event_id FROM check_in_outs 
+       WHERE student_id = $1 AND scan_type = 'CHECKIN' 
+       ORDER BY scanned_at DESC LIMIT 1`,
       [req.user.id]
     );
 

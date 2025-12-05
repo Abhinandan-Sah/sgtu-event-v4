@@ -369,7 +369,7 @@ class EventVolunteer {
       LEFT JOIN events e ON ev.event_id = e.id
       WHERE ev.volunteer_id = ${volunteerId}
         AND ev.is_active = TRUE
-        AND e.status = 'ACTIVE'
+        AND e.status IN ('APPROVED', 'ACTIVE')
       ORDER BY e.start_date DESC
       LIMIT 1
     `;
