@@ -69,6 +69,42 @@ const MIGRATIONS = [
     name: 'Image Fields',
     file: '008_add_image_fields.sql',
     description: 'Adds image_url to stalls, verifies banner_image_url in events'
+  },
+  {
+    id: '009',
+    name: 'Event Scoping',
+    file: '009_add_event_scoping.sql',
+    description: 'Adds event scoping to stalls and feedbacks'
+  },
+  {
+    id: '010',
+    name: 'Remove Requires Approval',
+    file: '010_remove_requires_approval.sql',
+    description: 'Removes requires_approval column from events'
+  },
+  {
+    id: '011',
+    name: 'School ID to Event Managers',
+    file: '011_add_school_id_to_event_managers.sql',
+    description: 'Adds school_id to event_managers table'
+  },
+  {
+    id: '012',
+    name: 'Rankings Published',
+    file: '012_add_rankings_published.sql',
+    description: 'Adds rankings_published column to events table'
+  },
+  {
+    id: '013',
+    name: 'Bulk Registration Tables',
+    file: '013_add_bulk_registration_tables.sql',
+    description: 'Adds bulk_registration_logs and bulk_registration_requests tables'
+  },
+  {
+    id: '014',
+    name: 'Refund Configuration',
+    file: '014_add_refund_configuration.sql',
+    description: 'Adds cancellation_deadline_hours, refund_tiers, cancellation_reason, cancelled_at to events table'
   }
 ];
 

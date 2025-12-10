@@ -1534,6 +1534,564 @@ class EventManagerController {
       return errorResponse(res, error.message, 500);
     }
   }
+
+  /**
+   * Cancel a single event registration (Event Manager)
+   * POST /api/event-manager/events/:eventId/cancel-registration
+   * Access: EVENT_MANAGER (must own the event)
+   * Body: { registration_number: "EN2024001", reason: "Optional reason" }
+   */
+  static async cancelRegistration(req, res) {
+    try {
+      const { eventId } = req.params;
+      const { registration_number, reason } = req.body;
+      const managerId = req.user.id;
+
+      if (!registration_number) {
+        return errorResponse(res, 'Please provide registration_number', 400);
+      }
+
+      // Import pool dynamically
+      const { pool } = await import('../config/db.js');
+
+      await pool('BEGIN');
+
+      // Fetch event and verify ownership
+      const eventResults = await query(
+        'SELECT * FROM events WHERE id = $1',
+        [eventId]
+      );
+
+      if (eventResults.length === 0) {
+        await pool('ROLLBACK');
+        return errorResponse(res, 'Event not found', 404);
+      }
+
+      const event = eventResults[0];
+
+      // Verify event manager ownership
+      if (event.created_by_manager_id !== managerId) {
+        await pool('ROLLBACK');
+        return errorResponse(res, 'Access denied. You can only cancel registrations for events you created', 403);
+      }
+
+      // Fetch registration by student registration number using JOIN
+      const regResults = await query(
+        `SELECT er.* FROM event_registrations er
+         INNER JOIN students s ON er.student_id = s.id
+         WHERE s.registration_no = $1 AND er.event_id = $2`,
+        [registration_number, eventId]
+      );
+
+      if (regResults.length === 0) {
+        await pool('ROLLBACK');
+        return errorResponse(res, 'Registration not found', 404);
+      }
+
+      const registration = regResults[0];
+      const registrationId = registration.id;
+
+      // Check if already cancelled
+      if (registration.registration_status === 'CANCELLED') {
+        await pool('ROLLBACK');
+        return errorResponse(res, 'Registration already cancelled', 400);
+      }
+
+      // Calculate refund for paid events
+      let refundDetails = null;
+      let razorpayRefundId = null;
+      if (event.event_type === 'PAID' && registration.payment_status === 'COMPLETED') {
+        const { calculateRefund } = await import('../utils/refundCalculator.js');
+        refundDetails = calculateRefund(event);
+
+        if (refundDetails.eligible && refundDetails.amount > 0) {
+          // Process refund via PaymentService
+          const { default: PaymentService } = await import('../services/payment.service.js');
+          const refundResult = await PaymentService.processRefund(
+            registration.razorpay_payment_id,
+            refundDetails.amount,
+            `Event Manager Cancellation: ${reason || 'No reason provided'}`
+          );
+
+          razorpayRefundId = refundResult.id;
+
+          // Update registration using model method (sets all refund fields)
+          await EventRegistrationModel.processRefund(
+            registrationId,
+            refundDetails.amount,
+            `Event Manager Cancellation: ${reason || 'No reason provided'}`
+          );
+        } else {
+          // No refund eligible - just cancel
+          await EventRegistrationModel.cancel(registrationId);
+        }
+      } else {
+        // Free event - just cancel
+        await EventRegistrationModel.cancel(registrationId);
+      }
+
+      // Decrement event capacity
+      await query(
+        'UPDATE events SET current_registrations = current_registrations - 1 WHERE id = $1',
+        [eventId]
+      );
+
+      // Promote from waitlist if applicable
+      const { promoteFromWaitlist } = await import('../services/waitlist.service.js');
+      await promoteFromWaitlist(eventId, 1);
+
+      await pool('COMMIT');
+
+      return res.status(200).json({
+        success: true,
+        message: 'Registration cancelled successfully',
+        data: {
+          registration_id: registrationId,
+          refund: refundDetails ? {
+            eligible: refundDetails.eligible,
+            amount: refundDetails.amount,
+            percent: refundDetails.percent,
+            razorpay_refund_id: razorpayRefundId
+          } : { eligible: false, amount: 0, percent: 0 }
+        }
+      });
+
+    } catch (error) {
+      await pool('ROLLBACK');
+      console.error('Cancel registration error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Bulk cancel event registrations (Event Manager)
+   * POST /api/event-manager/events/:eventId/bulk-cancel
+   * Access: EVENT_MANAGER (must own the event)
+   * Body: { registration_numbers: ["EN2024001", "EN2024002"] } - Array of student registration numbers
+   */
+  static async bulkCancelRegistrations(req, res) {
+    try {
+      const { eventId } = req.params;
+      const managerId = req.user.id;
+      const { reason } = req.body;
+
+      // Import pool dynamically
+      const { pool } = await import('../config/db.js');
+
+      // Verify event ownership
+      const eventResults = await query(
+        'SELECT * FROM events WHERE id = $1',
+        [eventId]
+      );
+
+      if (eventResults.length === 0) {
+        return errorResponse(res, 'Event not found', 404);
+      }
+
+      const event = eventResults[0];
+
+      if (event.created_by_manager_id !== managerId) {
+        return errorResponse(res, 'Access denied. You can only cancel registrations for events you created', 403);
+      }
+
+      // Get registration numbers from request body
+      let registrationNumbers = [];
+
+      if (req.body.registration_numbers && Array.isArray(req.body.registration_numbers)) {
+        registrationNumbers = req.body.registration_numbers.filter(regNo => regNo && regNo.trim());
+      } else {
+        return errorResponse(res, 'Please provide registration_numbers array', 400);
+      }
+
+      if (registrationNumbers.length === 0) {
+        return errorResponse(res, 'No valid registration numbers provided', 400);
+      }
+
+      // Process cancellations
+      const results = {
+        total: registrationNumbers.length,
+        successful: 0,
+        failed: 0,
+        errors: []
+      };
+
+      for (const registrationNumber of registrationNumbers) {
+        try {
+          await pool('BEGIN');
+
+          // Find registration by student registration number using JOIN
+          const regResults = await query(
+            `SELECT er.* FROM event_registrations er
+             INNER JOIN students s ON er.student_id = s.id
+             WHERE s.registration_no = $1 AND er.event_id = $2`,
+            [registrationNumber, eventId]
+          );
+
+          if (regResults.length === 0) {
+            results.failed++;
+            results.errors.push({
+              registration_number: registrationNumber,
+              error: 'Registration not found'
+            });
+            await pool('ROLLBACK');
+            continue;
+          }
+
+          const registration = regResults[0];
+
+          if (registration.registration_status === 'CANCELLED') {
+            results.failed++;
+            results.errors.push({
+              registration_number: registrationNumber,
+              error: 'Already cancelled'
+            });
+            await pool('ROLLBACK');
+            continue;
+          }
+
+          // Calculate refund for paid events
+          if (event.event_type === 'PAID' && registration.payment_status === 'COMPLETED') {
+            const { calculateRefund } = await import('../utils/refundCalculator.js');
+            const refundDetails = calculateRefund(event);
+
+            if (refundDetails.eligible && refundDetails.amount > 0) {
+              const { default: PaymentService } = await import('../services/payment.service.js');
+              await PaymentService.processRefund(
+                registration.razorpay_payment_id,
+                refundDetails.amount,
+                `Bulk Cancellation: ${reason || 'No reason provided'}`
+              );
+
+              // Update using model method
+              await EventRegistrationModel.processRefund(
+                registration.id,
+                refundDetails.amount,
+                `Bulk Cancellation: ${reason || 'No reason provided'}`
+              );
+            } else {
+              // No refund eligible
+              await EventRegistrationModel.cancel(registration.id);
+            }
+          } else {
+            // Free event
+            await EventRegistrationModel.cancel(registration.id);
+          }
+
+          // Decrement capacity
+          await query(
+            'UPDATE events SET current_registrations = current_registrations - 1 WHERE id = $1',
+            [eventId]
+          );
+
+          await pool('COMMIT');
+          results.successful++;
+
+        } catch (error) {
+          await pool('ROLLBACK');
+          results.failed++;
+          results.errors.push({
+            registration_number: registrationNumber,
+            error: error.message
+          });
+        }
+      }
+
+      // Promote from waitlist for all cancelled spots
+      if (results.successful > 0) {
+        const { promoteFromWaitlist } = await import('../services/waitlist.service.js');
+        await promoteFromWaitlist(eventId, results.successful);
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `Bulk cancellation completed: ${results.successful} successful, ${results.failed} failed`,
+        data: results
+      });
+
+    } catch (error) {
+      console.error('Bulk cancel error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Get registration details by registration number
+   * GET /api/event-manager/events/:eventId/registrations/by-number/:registrationNumber
+   * Access: EVENT_MANAGER (must own the event)
+   * Returns: Full registration details with student info for cancellation operations
+   */
+  static async getRegistrationByNumber(req, res) {
+    try {
+      const { eventId, registrationNumber } = req.params;
+      const managerId = req.user.id;
+
+      // Verify event ownership
+      const event = await EventModel.findById(eventId);
+      if (!event) {
+        return errorResponse(res, 'Event not found', 404);
+      }
+
+      if (event.created_by_manager_id !== managerId) {
+        return errorResponse(res, 'Access denied. You can only view registrations for events you created', 403);
+      }
+
+      // Find registration using JOIN with students table
+      const registrations = await query(
+        `SELECT 
+           er.*,
+           s.full_name as student_name,
+           s.registration_no as student_registration_no,
+           s.email as student_email,
+           s.phone as student_phone,
+           s.school_id,
+           sc.school_name
+         FROM event_registrations er
+         INNER JOIN students s ON er.student_id = s.id
+         LEFT JOIN schools sc ON s.school_id = sc.id
+         WHERE s.registration_no = $1 AND er.event_id = $2`,
+        [registrationNumber, eventId]
+      );
+
+      if (registrations.length === 0) {
+        return errorResponse(res, 'Registration not found', 404);
+      }
+
+      return successResponse(res, registrations[0]);
+    } catch (error) {
+      console.error('Get registration by number error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Check if registration is cancellable and get refund details
+   * GET /api/event-manager/events/:eventId/registrations/check-cancellable/:registrationNumber
+   * Access: EVENT_MANAGER (must own the event)
+   * Returns: { cancellable: boolean, reason: string, refund: { eligible, amount, percent } }
+   */
+  static async checkCancellable(req, res) {
+    try {
+      const { eventId, registrationNumber } = req.params;
+      const managerId = req.user.id;
+
+      // Verify event ownership
+      const event = await EventModel.findById(eventId);
+      if (!event) {
+        return errorResponse(res, 'Event not found', 404);
+      }
+
+      if (event.created_by_manager_id !== managerId) {
+        return errorResponse(res, 'Access denied', 403);
+      }
+
+      // Find registration
+      const registrations = await query(
+        `SELECT 
+           er.*,
+           s.full_name as student_name,
+           s.registration_no as student_registration_no
+         FROM event_registrations er
+         INNER JOIN students s ON er.student_id = s.id
+         WHERE s.registration_no = $1 AND er.event_id = $2`,
+        [registrationNumber, eventId]
+      );
+
+      if (registrations.length === 0) {
+        return errorResponse(res, 'Registration not found', 404);
+      }
+
+      const registration = registrations[0];
+
+      // Check if already cancelled
+      if (registration.registration_status === 'CANCELLED') {
+        return successResponse(res, {
+          cancellable: false,
+          reason: 'Registration is already cancelled',
+          refund: null,
+          registration: {
+            student_name: registration.student_name,
+            student_registration_no: registration.student_registration_no,
+            registration_status: registration.registration_status
+          }
+        });
+      }
+
+      // Calculate refund for paid events
+      let refundDetails = null;
+      if (event.event_type === 'PAID' && registration.payment_status === 'COMPLETED') {
+        const { calculateRefund } = await import('../utils/refundCalculator.js');
+        refundDetails = calculateRefund(event);
+      }
+
+      return successResponse(res, {
+        cancellable: true,
+        reason: 'Registration can be cancelled',
+        refund: refundDetails || { eligible: false, amount: 0, percent: 0 },
+        registration: {
+          student_name: registration.student_name,
+          student_registration_no: registration.student_registration_no,
+          registration_status: registration.registration_status,
+          payment_status: registration.payment_status,
+          payment_amount: registration.payment_amount
+        }
+      });
+    } catch (error) {
+      console.error('Check cancellable error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Search registrations by name, email, phone, or registration number
+   * GET /api/event-manager/events/:eventId/registrations/search?q=<query>
+   * Access: EVENT_MANAGER (must own the event)
+   * Returns: Filtered registrations matching search query
+   */
+  static async searchRegistrations(req, res) {
+    try {
+      const { eventId } = req.params;
+      const { q, page = 1, limit = 50 } = req.query;
+      const managerId = req.user.id;
+
+      if (!q || q.trim().length === 0) {
+        return errorResponse(res, 'Search query is required', 400);
+      }
+
+      const searchTerm = q.trim();
+
+      // Verify event ownership
+      const event = await EventModel.findById(eventId);
+      if (!event) {
+        return errorResponse(res, 'Event not found', 404);
+      }
+
+      if (event.created_by_manager_id !== managerId) {
+        return errorResponse(res, 'Access denied', 403);
+      }
+
+      const offset = (parseInt(page) - 1) * parseInt(limit);
+
+      // Search across name, email, phone, and registration_no
+      const results = await query(
+        `SELECT 
+           er.*,
+           s.full_name as student_name,
+           s.registration_no as student_registration_no,
+           s.email as student_email,
+           s.phone as student_phone,
+           COUNT(*) OVER() as total_count
+         FROM event_registrations er
+         INNER JOIN students s ON er.student_id = s.id
+         WHERE er.event_id = $1
+           AND (
+             LOWER(s.full_name) LIKE LOWER($2)
+             OR LOWER(s.email) LIKE LOWER($2)
+             OR s.phone LIKE $2
+             OR LOWER(s.registration_no) LIKE LOWER($2)
+           )
+         ORDER BY er.registered_at DESC
+         LIMIT $3 OFFSET $4`,
+        [eventId, `%${searchTerm}%`, parseInt(limit), offset]
+      );
+
+      return successResponse(res, {
+        data: results,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: results[0]?.total_count || 0,
+          totalPages: Math.ceil((results[0]?.total_count || 0) / parseInt(limit))
+        },
+        search_query: searchTerm
+      });
+    } catch (error) {
+      console.error('Search registrations error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Get refund history for event
+   * GET /api/event-manager/events/:eventId/refunds
+   * Access: EVENT_MANAGER (must own the event)
+   * Returns: List of all refunds issued for the event
+   */
+  static async getRefundHistory(req, res) {
+    try {
+      const { eventId } = req.params;
+      const { page = 1, limit = 50 } = req.query;
+      const managerId = req.user.id;
+
+      // Verify event ownership
+      const event = await EventModel.findById(eventId);
+      if (!event) {
+        return errorResponse(res, 'Event not found', 404);
+      }
+
+      if (event.created_by_manager_id !== managerId) {
+        return errorResponse(res, 'Access denied', 403);
+      }
+
+      const offset = (parseInt(page) - 1) * parseInt(limit);
+
+      // Get all refunded registrations
+      const refunds = await query(
+        `SELECT 
+           er.id as registration_id,
+           er.refund_amount,
+           er.refund_reason,
+           er.refunded_at,
+           er.payment_amount as original_amount,
+           er.razorpay_payment_id,
+           s.full_name as student_name,
+           s.registration_no as student_registration_no,
+           s.email as student_email,
+           s.phone as student_phone,
+           COUNT(*) OVER() as total_count
+         FROM event_registrations er
+         INNER JOIN students s ON er.student_id = s.id
+         WHERE er.event_id = $1
+           AND er.refund_initiated = TRUE
+           AND er.refund_amount IS NOT NULL
+         ORDER BY er.refunded_at DESC
+         LIMIT $2 OFFSET $3`,
+        [eventId, parseInt(limit), offset]
+      );
+
+      // Calculate summary stats
+      const summary = await query(
+        `SELECT 
+           COUNT(*) as total_refunds,
+           COALESCE(SUM(refund_amount), 0) as total_refunded,
+           COALESCE(AVG(refund_amount), 0) as average_refund
+         FROM event_registrations
+         WHERE event_id = $1
+           AND refund_initiated = TRUE
+           AND refund_amount IS NOT NULL`,
+        [eventId]
+      );
+
+      return successResponse(res, {
+        data: refunds,
+        summary: {
+          total_refunds: parseInt(summary[0]?.total_refunds || 0),
+          total_refunded: parseFloat(summary[0]?.total_refunded || 0),
+          average_refund: parseFloat(summary[0]?.average_refund || 0)
+        },
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: refunds[0]?.total_count || 0,
+          totalPages: Math.ceil((refunds[0]?.total_count || 0) / parseInt(limit))
+        }
+      });
+    } catch (error) {
+      console.error('Get refund history error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
 }
 
 export default EventManagerController;
+
+

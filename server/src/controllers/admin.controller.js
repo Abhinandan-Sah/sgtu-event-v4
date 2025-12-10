@@ -2679,6 +2679,441 @@ const updateEventCapacity = async (req, res, next) => {
   }
 };
 
+/**
+ * Cancel single registration (admin override)
+ * POST /api/admin/registrations/:registrationId/cancel
+ */
+const cancelRegistration = async (req, res, next) => {
+  try {
+    const { registrationId } = req.params;
+    const { force = false, custom_refund_amount, reason = 'Admin cancellation' } = req.body;
+    const adminId = req.user.id;
+
+    // Import services
+    const { calculateRefund } = await import('../utils/refundCalculator.js');
+    const { promoteFromWaitlist } = await import('../services/waitlist.service.js');
+    const PaymentService = (await import('../services/payment.js')).default;
+
+    // Find registration
+    const registrationResult = await pool`
+      SELECT er.*, e.event_name, e.event_type, e.price, e.start_date, 
+             e.refund_enabled, e.cancellation_deadline_hours, e.refund_tiers
+      FROM event_registrations er
+      JOIN events e ON er.event_id = e.id
+      WHERE er.id = ${registrationId}
+    `;
+
+    if (registrationResult.length === 0) {
+      return errorResponse(res, 'Registration not found', 404);
+    }
+
+    const registration = registrationResult[0];
+
+    // Check if already cancelled
+    if (registration.registration_status === 'CANCELLED') {
+      return errorResponse(res, 'Registration already cancelled', 400);
+    }
+
+    // Check if registration is confirmed
+    if (registration.registration_status !== 'CONFIRMED') {
+      return errorResponse(res, 'Only confirmed registrations can be cancelled', 400);
+    }
+
+    await pool('BEGIN');
+
+    try {
+      let refundInfo = null;
+
+      // Handle paid events
+      if (registration.event_type === 'PAID' && registration.payment_status === 'COMPLETED') {
+        let refundAmount;
+        let refundReason;
+
+        if (force && custom_refund_amount !== undefined) {
+          // Admin override with custom amount
+          refundAmount = parseFloat(custom_refund_amount);
+          refundReason = reason;
+        } else if (force) {
+          // Admin override with full refund
+          refundAmount = parseFloat(registration.payment_amount);
+          refundReason = reason;
+        } else {
+          // Calculate refund based on policy
+          const event = {
+            event_type: registration.event_type,
+            price: registration.price,
+            start_date: registration.start_date,
+            refund_enabled: registration.refund_enabled,
+            cancellation_deadline_hours: registration.cancellation_deadline_hours,
+            refund_tiers: registration.refund_tiers
+          };
+
+          const refundCalculation = calculateRefund(event, new Date());
+
+          if (!refundCalculation.eligible) {
+            await pool('ROLLBACK');
+            return errorResponse(res, refundCalculation.reason, 400);
+          }
+
+          refundAmount = refundCalculation.amount;
+          refundReason = refundCalculation.reason;
+        }
+
+        // Process refund in database
+        await EventRegistration.processRefund(
+          registration.id,
+          refundAmount,
+          refundReason
+        );
+
+        // Process refund via Razorpay
+        const razorpayRefund = await PaymentService.processRefund({
+          payment_id: registration.razorpay_payment_id,
+          amount: refundAmount,
+          notes: {
+            reason: reason,
+            admin_id: adminId,
+            admin_override: force
+          }
+        });
+
+        refundInfo = {
+          refund_amount: refundAmount,
+          refund_id: razorpayRefund.id,
+          refund_status: razorpayRefund.status,
+          admin_override: force
+        };
+      } else {
+        // Cancel free event registration
+        await EventRegistration.cancel(registration.id);
+      }
+
+      // Log admin action
+      await pool`
+        INSERT INTO audit_logs (
+          event_type,
+          user_id,
+          user_role,
+          resource_type,
+          resource_id,
+          metadata
+        ) VALUES (
+          'ADMIN_CANCEL_REGISTRATION',
+          ${adminId},
+          'ADMIN',
+          'REGISTRATION',
+          ${registrationId},
+          ${JSON.stringify({
+            student_id: registration.student_id,
+            event_id: registration.event_id,
+            event_name: registration.event_name,
+            reason: reason,
+            force_override: force,
+            refund_amount: refundInfo?.refund_amount
+          })}
+        )
+      `;
+
+      // Promote from waitlist
+      const waitlistResult = await promoteFromWaitlist(registration.event_id, 1);
+
+      await pool('COMMIT');
+
+      return successResponse(res, {
+        success: true,
+        message: 'Registration cancelled by admin',
+        registration_id: registrationId,
+        event_name: registration.event_name,
+        admin_override: force,
+        reason: reason,
+        waitlist_promoted: waitlistResult.promoted_count,
+        ...refundInfo
+      }, 'Registration cancelled successfully');
+    } catch (error) {
+      await pool('ROLLBACK');
+      console.error('Admin cancellation error:', error);
+      throw error;
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Cancel entire event (cascade all registrations with refunds)
+ * DELETE /api/admin/events/:eventId
+ */
+const cancelEvent = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+    const { reason = 'Event cancelled by admin' } = req.body;
+    const adminId = req.user.id;
+
+    // Check if event exists
+    const event = await EventModel.findById(eventId);
+    if (!event) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    // Check if event is already cancelled
+    if (event.status === 'CANCELLED') {
+      return errorResponse(res, 'Event is already cancelled', 400);
+    }
+
+    // Delete event (cascade cancellations)
+    const result = await EventModel.delete(eventId, reason);
+
+    // Log admin action
+    await pool`
+      INSERT INTO audit_logs (
+        event_type,
+        user_id,
+        user_role,
+        resource_type,
+        resource_id,
+        metadata
+      ) VALUES (
+        'ADMIN_CANCEL_EVENT',
+        ${adminId},
+        'ADMIN',
+        'EVENT',
+        ${eventId},
+        ${JSON.stringify({
+          event_name: event.event_name,
+          event_code: event.event_code,
+          reason: reason,
+          registrations_affected: result.registrations_cancelled,
+          refunds_processed: result.refunds_processed,
+          total_refunded: result.total_refunded
+        })}
+      )
+    `;
+
+    return successResponse(res, {
+      ...result,
+      event_name: event.event_name,
+      event_code: event.event_code,
+      cancellation_reason: reason,
+      message: `Event cancelled. ${result.registrations_cancelled} registrations cancelled, ${result.refunds_processed} refunds processed (₹${result.total_refunded})`
+    }, 'Event cancelled successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Search students by name, email, phone, registration_no, or school
+const searchStudents = async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    if (!q || q.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Search query is required'
+      });
+    }
+
+    const searchPattern = `%${q.trim()}%`;
+
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM students
+      WHERE 
+        name ILIKE $1 OR 
+        email ILIKE $1 OR 
+        phone ILIKE $1 OR 
+        registration_no ILIKE $1 OR
+        school_name ILIKE $1
+    `;
+
+    const countResult = await pool.query(countQuery, [searchPattern]);
+    const total = parseInt(countResult.rows[0].total);
+
+    const searchQuery = `
+      SELECT 
+        id,
+        name,
+        email,
+        phone,
+        registration_no,
+        school_name,
+        course,
+        branch,
+        semester,
+        division,
+        created_at
+      FROM students
+      WHERE 
+        name ILIKE $1 OR 
+        email ILIKE $1 OR 
+        phone ILIKE $1 OR 
+        registration_no ILIKE $1 OR
+        school_name ILIKE $1
+      ORDER BY created_at DESC
+      LIMIT $2 OFFSET $3
+    `;
+
+    const result = await pool.query(searchQuery, [searchPattern, limit, offset]);
+
+    res.json({
+      success: true,
+      data: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Search events by name, code, description, or manager name
+const searchEvents = async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    if (!q || q.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Search query is required'
+      });
+    }
+
+    const searchPattern = `%${q.trim()}%`;
+
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM events e
+      LEFT JOIN event_managers em ON e.event_manager_id = em.id
+      WHERE 
+        e.event_name ILIKE $1 OR 
+        e.event_code ILIKE $1 OR 
+        e.description ILIKE $1 OR
+        em.name ILIKE $1
+    `;
+
+    const countResult = await pool.query(countQuery, [searchPattern]);
+    const total = parseInt(countResult.rows[0].total);
+
+    const searchQuery = `
+      SELECT 
+        e.id,
+        e.event_name,
+        e.event_code,
+        e.description,
+        e.event_manager_id,
+        em.name as manager_name,
+        em.email as manager_email,
+        e.max_participants,
+        e.start_date,
+        e.end_date,
+        e.created_at
+      FROM events e
+      LEFT JOIN event_managers em ON e.event_manager_id = em.id
+      WHERE 
+        e.event_name ILIKE $1 OR 
+        e.event_code ILIKE $1 OR 
+        e.description ILIKE $1 OR
+        em.name ILIKE $1
+      ORDER BY e.created_at DESC
+      LIMIT $2 OFFSET $3
+    `;
+
+    const result = await pool.query(searchQuery, [searchPattern, limit, offset]);
+
+    res.json({
+      success: true,
+      data: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Get platform-wide refund history with aggregated stats
+const getPlatformRefunds = async (req, res, next) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = (page - 1) * limit;
+
+    // Get aggregated refund stats
+    const statsQuery = `
+      SELECT 
+        COUNT(*) as total_refunds,
+        COALESCE(SUM(refund_amount), 0) as total_refund_amount,
+        COUNT(DISTINCT event_id) as events_with_refunds,
+        COUNT(DISTINCT student_id) as unique_students_refunded
+      FROM event_registrations
+      WHERE status = 'cancelled' AND refund_amount > 0
+    `;
+
+    const statsResult = await pool.query(statsQuery);
+
+    // Get paginated refund history
+    const refundsQuery = `
+      SELECT 
+        er.id,
+        er.event_id,
+        e.event_name,
+        e.event_code,
+        er.student_id,
+        s.name as student_name,
+        s.email as student_email,
+        s.registration_no,
+        er.registration_fee,
+        er.refund_amount,
+        er.cancellation_reason,
+        er.cancelled_at,
+        em.name as cancelled_by_manager
+      FROM event_registrations er
+      INNER JOIN events e ON er.event_id = e.id
+      INNER JOIN students s ON er.student_id = s.id
+      LEFT JOIN event_managers em ON e.event_manager_id = em.id
+      WHERE er.status = 'cancelled' AND er.refund_amount > 0
+      ORDER BY er.cancelled_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+
+    const refundsResult = await pool.query(refundsQuery, [limit, offset]);
+    const total = parseInt(statsResult.rows[0].total_refunds);
+
+    res.json({
+      success: true,
+      data: refundsResult.rows,
+      summary: {
+        totalRefunds: parseInt(statsResult.rows[0].total_refunds),
+        totalRefundAmount: parseFloat(statsResult.rows[0].total_refund_amount),
+        eventsWithRefunds: parseInt(statsResult.rows[0].events_with_refunds),
+        uniqueStudentsRefunded: parseInt(statsResult.rows[0].unique_students_refunded)
+      },
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export default {
   login,
   logout,
@@ -2730,4 +3165,11 @@ export default {
   approveBulkRegistration,
   rejectBulkRegistration,
   updateEventCapacity,
+  // Deregistration and Refunds
+  cancelRegistration,
+  cancelEvent,
+  // Search and Platform Refunds
+  searchStudents,
+  searchEvents,
+  getPlatformRefunds,
 };

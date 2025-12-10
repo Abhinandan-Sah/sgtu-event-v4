@@ -27,6 +27,8 @@ class Event {
       waitlist_enabled = false,
       refund_policy = null,
       refund_enabled = false,
+      cancellation_deadline_hours = 24,
+      refund_tiers = null,
       banner_image_url = null,
       event_images = []
     } = eventData;
@@ -34,6 +36,25 @@ class Event {
     // Validation
     if (event_type === 'PAID' && price <= 0) {
       throw new Error('Paid events must have a price greater than 0');
+    }
+
+    // Validate refund configuration
+    if (refund_enabled && refund_tiers) {
+      if (!Array.isArray(refund_tiers)) {
+        throw new Error('refund_tiers must be an array');
+      }
+      for (const tier of refund_tiers) {
+        if (typeof tier.days_before !== 'number' || tier.days_before < 0) {
+          throw new Error('days_before must be a non-negative number');
+        }
+        if (typeof tier.percent !== 'number' || tier.percent < 0 || tier.percent > 100) {
+          throw new Error('percent must be between 0 and 100');
+        }
+      }
+    }
+
+    if (cancellation_deadline_hours !== null && cancellation_deadline_hours < 0) {
+      throw new Error('cancellation_deadline_hours must be non-negative');
     }
 
     if (new Date(start_date) >= new Date(end_date)) {
@@ -50,7 +71,7 @@ class Event {
         event_category, tags, venue,
         start_date, end_date, registration_start_date, registration_end_date,
         max_capacity, waitlist_enabled,
-        refund_policy, refund_enabled,
+        refund_policy, refund_enabled, cancellation_deadline_hours, refund_tiers,
         banner_image_url, event_images,
         created_by_manager_id,
         status
@@ -60,7 +81,7 @@ class Event {
         ${event_category}, ${tags}, ${venue},
         ${start_date}, ${end_date}, ${registration_start_date}, ${registration_end_date},
         ${max_capacity}, ${waitlist_enabled},
-        ${refund_policy}, ${refund_enabled},
+        ${refund_policy}, ${refund_enabled}, ${cancellation_deadline_hours}, ${refund_tiers},
         ${banner_image_url}, ${event_images},
         ${managerId},
         'DRAFT'
@@ -543,31 +564,92 @@ class Event {
   }
 
   /**
-   * Delete event (soft delete - mark as cancelled)
+   * Delete event (soft delete - mark as cancelled with cascade refunds)
    * @param {string} eventId - Event UUID
-   * @returns {Promise<boolean>}
+   * @param {string} cancellationReason - Reason for cancellation
+   * @returns {Promise<Object>}
    */
-  static async delete(eventId) {
-    // Check if event has registrations
-    const registrations = await pool`
-      SELECT COUNT(*) as count 
-      FROM event_registrations 
-      WHERE event_id = ${eventId}
-        AND registration_status = 'CONFIRMED'
-    `;
+  static async delete(eventId, cancellationReason = 'Event cancelled by organizer') {
+    // Import required services at method level to avoid circular dependencies
+    const EventRegistrationModel = (await import('./EventRegistration.model.js')).default;
+    const PaymentService = (await import('../services/payment.js')).default;
 
-    if (registrations[0].count > 0) {
-      throw new Error('Cannot delete event with active registrations. Cancel the event instead.');
+    await pool('BEGIN');
+
+    try {
+      // Get all active registrations
+      const registrations = await pool`
+        SELECT id, student_id, payment_status, razorpay_payment_id, payment_amount 
+        FROM event_registrations 
+        WHERE event_id = ${eventId}
+          AND registration_status = 'CONFIRMED'
+      `;
+
+      let cancelledCount = 0;
+      let refundCount = 0;
+      let totalRefunded = 0;
+      const failedRefunds = [];
+
+      // Cancel all registrations
+      for (const reg of registrations) {
+        try {
+          if (reg.payment_status === 'COMPLETED' && reg.razorpay_payment_id) {
+            // Process refund for paid registrations
+            await EventRegistrationModel.processRefund(
+              reg.id,
+              parseFloat(reg.payment_amount),
+              cancellationReason
+            );
+
+            // Call Razorpay API for actual refund
+            await PaymentService.processRefund({
+              payment_id: reg.razorpay_payment_id,
+              amount: parseFloat(reg.payment_amount)
+            });
+
+            refundCount++;
+            totalRefunded += parseFloat(reg.payment_amount);
+          } else {
+            // Cancel free registrations or pending payments
+            await EventRegistrationModel.cancel(reg.id);
+          }
+          cancelledCount++;
+        } catch (error) {
+          console.error(`Failed to cancel registration ${reg.id}:`, error);
+          failedRefunds.push({
+            student_id: reg.student_id,
+            registration_id: reg.id,
+            reason: error.message
+          });
+        }
+      }
+
+      // Mark event as cancelled
+      await pool`
+        UPDATE events 
+        SET 
+          status = 'CANCELLED',
+          cancellation_reason = ${cancellationReason},
+          updated_at = NOW()
+        WHERE id = ${eventId}
+      `;
+
+      await pool('COMMIT');
+
+      return {
+        success: true,
+        registrations_cancelled: cancelledCount,
+        free_cancellations: cancelledCount - refundCount,
+        paid_cancellations: refundCount,
+        refunds_processed: refundCount,
+        total_refunded: totalRefunded,
+        failed_refunds: failedRefunds
+      };
+    } catch (error) {
+      await pool('ROLLBACK');
+      console.error('Event deletion failed:', error);
+      throw error;
     }
-
-    // Soft delete
-    await pool`
-      UPDATE events 
-      SET status = 'CANCELLED', updated_at = NOW()
-      WHERE id = ${eventId}
-    `;
-
-    return true;
   }
 
   /**

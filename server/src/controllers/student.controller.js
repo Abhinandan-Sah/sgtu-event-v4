@@ -1285,6 +1285,120 @@ const getMyRegisteredEvents = async (req, res, next) => {
 };
 
 /**
+ * Cancel event registration (deregister from event)
+ * @route POST /api/student/events/:eventId/deregister
+ */
+const cancelEventRegistration = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+    const studentId = req.user.id;
+
+    // Import services
+    const { calculateRefund } = await import('../utils/refundCalculator.js');
+    const { promoteFromWaitlist } = await import('../services/waitlist.service.js');
+    const { pool } = await import('../config/db.js');
+
+    // Find registration
+    const registration = await EventRegistrationModel.getByStudentAndEvent(eventId, studentId);
+    if (!registration) {
+      return errorResponse(res, 'Registration not found', 404);
+    }
+
+    // Check if already cancelled
+    if (registration.registration_status === 'CANCELLED') {
+      return errorResponse(res, 'Registration already cancelled', 400);
+    }
+
+    // Check if registration is confirmed
+    if (registration.registration_status !== 'CONFIRMED') {
+      return errorResponse(res, 'Only confirmed registrations can be cancelled', 400);
+    }
+
+    // Get event details
+    const event = await EventModel.findById(eventId);
+    if (!event) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    // Check if event already occurred
+    if (new Date(event.start_date) < new Date()) {
+      return errorResponse(res, 'Cannot cancel registration for past events', 400);
+    }
+
+    await pool('BEGIN');
+
+    try {
+      let refundInfo = null;
+
+      // Handle paid events
+      if (event.event_type === 'PAID' && registration.payment_status === 'COMPLETED') {
+        // Calculate refund eligibility
+        const refundCalculation = calculateRefund(event, new Date());
+
+        if (!refundCalculation.eligible) {
+          await pool('ROLLBACK');
+          return errorResponse(res, refundCalculation.reason, 400);
+        }
+
+        // Process refund in database
+        await EventRegistrationModel.processRefund(
+          registration.id,
+          refundCalculation.amount,
+          refundCalculation.reason
+        );
+
+        // Process refund via Razorpay
+        const razorpayRefund = await PaymentService.processRefund({
+          payment_id: registration.razorpay_payment_id,
+          amount: refundCalculation.amount,
+          notes: {
+            reason: 'Student cancellation',
+            student_id: studentId,
+            event_id: eventId
+          }
+        });
+
+        refundInfo = {
+          refund_amount: refundCalculation.amount,
+          refund_percent: refundCalculation.percent,
+          refund_id: razorpayRefund.id,
+          razorpay_refund_id: razorpayRefund.id,
+          refund_status: razorpayRefund.status,
+          reason: refundCalculation.reason
+        };
+      } else {
+        // Cancel free event registration
+        await EventRegistrationModel.cancel(registration.id);
+      }
+
+      // Promote from waitlist if capacity available
+      const waitlistResult = await promoteFromWaitlist(eventId, 1);
+
+      await pool('COMMIT');
+
+      const responseData = {
+        success: true,
+        message: event.event_type === 'PAID' && refundInfo 
+          ? `Registration cancelled with ${refundInfo.refund_percent}% refund`
+          : 'Registration cancelled successfully',
+        registration_id: registration.id,
+        event_name: event.event_name,
+        waitlist_promoted: waitlistResult.promoted_count,
+        ...refundInfo
+      };
+
+      return successResponse(res, responseData, 'Registration cancelled successfully');
+    } catch (error) {
+      await pool('ROLLBACK');
+      console.error('Cancellation error:', error);
+      throw error;
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * Get universal student QR code (works for ALL registered events)
  * @route GET /api/student/qr-code
  * 
@@ -1624,6 +1738,7 @@ export default {
   initiatePaidEventPayment,
   verifyPayment,
   getMyRegisteredEvents,
+  cancelEventRegistration,
   getEventQRCode,
   // Event-scoped methods (NEW)
   submitEventFeedback,

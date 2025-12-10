@@ -199,6 +199,27 @@ router.patch(
 );
 
 // ============================================================
+// DEREGISTRATION & REFUND ROUTES
+// ============================================================
+
+/**
+ * @route   POST /api/admin/registrations/:registrationId/cancel
+ * @desc    Cancel single registration (admin override)
+ * @access  Private (ADMIN)
+ */
+router.post(
+  '/registrations/:registrationId/cancel',
+  adminController.cancelRegistration
+);
+
+/**
+ * @route   POST /api/admin/events/:eventId/cancel
+ * @desc    Cancel entire event with cascade refunds
+ * @access  Private (ADMIN)
+ */
+router.post('/events/:eventId/cancel', adminController.cancelEvent);
+
+// ============================================================
 // EVENT MANAGER MANAGEMENT ROUTES (Multi-Event Support)
 // ============================================================
 
@@ -353,5 +374,30 @@ router.patch('/events/:id/unpublish-rankings', adminController.unpublishRankings
  * @access  Private (ADMIN)
  */
 router.patch('/events/:id/reset-rankings-visibility', adminController.resetRankingsVisibility);
+
+// ============================================================
+// SEARCH AND PLATFORM REFUNDS
+// ============================================================
+
+/**
+ * @route   GET /api/admin/students/search?q=<query>&page=1&limit=20
+ * @desc    Search students by name, email, phone, registration_no, or school
+ * @access  Private (ADMIN)
+ */
+router.get('/students/search', adminController.searchStudents);
+
+/**
+ * @route   GET /api/admin/events/search?q=<query>&page=1&limit=20
+ * @desc    Search events by name, code, description, or manager name
+ * @access  Private (ADMIN)
+ */
+router.get('/events/search', adminController.searchEvents);
+
+/**
+ * @route   GET /api/admin/refunds?page=1&limit=50
+ * @desc    Get platform-wide refund history with aggregated stats
+ * @access  Private (ADMIN)
+ */
+router.get('/refunds', adminController.getPlatformRefunds);
 
 export default router;

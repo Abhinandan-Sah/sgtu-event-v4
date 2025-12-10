@@ -80,6 +80,13 @@ router.post('/events/:eventId/payment/initiate', studentController.initiatePaidE
 router.post('/events/:eventId/payment/verify', studentController.verifyPayment);
 
 /**
+ * @route   POST /api/student/events/:eventId/deregister
+ * @desc    Cancel event registration (deregister from event)
+ * @access  Private (STUDENT)
+ */
+router.post('/events/:eventId/deregister', studentController.cancelEventRegistration);
+
+/**
  * @route   GET /api/student/my-events
  * @desc    Get student's registered events
  * @access  Private (STUDENT)

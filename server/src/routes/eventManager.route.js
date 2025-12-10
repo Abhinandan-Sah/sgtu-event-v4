@@ -134,6 +134,38 @@ router.delete('/events/:eventId', EventManagerController.deleteEvent);
 router.get('/events/:eventId/registrations', EventManagerController.getEventRegistrations);
 
 /**
+ * @route   GET /api/event-manager/events/:eventId/registrations/search
+ * @desc    Search registrations by name, email, phone, or registration number
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @query   q (required) - Search term, page, limit
+ * @returns { data: [], pagination, search_query }
+ * @example /events/123/registrations/search?q=john&page=1&limit=20
+ */
+router.get('/events/:eventId/registrations/search',
+  EventManagerController.searchRegistrations
+);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/registrations/by-number/:registrationNumber
+ * @desc    Get single registration details by student registration number
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @returns { success, data: { registration details with student info } }
+ */
+router.get('/events/:eventId/registrations/by-number/:registrationNumber',
+  EventManagerController.getRegistrationByNumber
+);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/registrations/check-cancellable/:registrationNumber
+ * @desc    Check if a registration is cancellable and get refund eligibility
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @returns { cancellable, reason, refund: { eligible, amount, percent }, registration }
+ */
+router.get('/events/:eventId/registrations/check-cancellable/:registrationNumber',
+  EventManagerController.checkCancellable
+);
+
+/**
  * @route   POST /api/event-manager/events/:eventId/submit-for-approval
  * @desc    Submit event for admin approval (DRAFT -> PENDING_APPROVAL)
  * @access  Private (EVENT_MANAGER - owner only)
@@ -204,6 +236,16 @@ router.get(
  * @access  Private (EVENT_MANAGER - owner only)
  */
 router.get('/events/:eventId/analytics', EventManagerController.getEventAnalytics);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/refunds
+ * @desc    Get refund history for event (all issued refunds)
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @query   page, limit
+ * @returns { data: [], summary: { total_refunds, total_refunded, average_refund }, pagination }
+ * @note    Useful for financial reconciliation and audit trail
+ */
+router.get('/events/:eventId/refunds', EventManagerController.getRefundHistory);
 
 // ============================================================
 // STALL MANAGEMENT ROUTES (CRUD Operations)
@@ -355,6 +397,38 @@ router.get('/events/:eventId/rankings/schools',
 router.get('/events/:eventId/rankings/all',
   validateEventOwnershipForViewOnly,
   RankingController.getAllRankings
+);
+
+// ============================================================
+// CANCELLATION ROUTES
+// ============================================================
+
+/**
+ * @route   POST /api/event-manager/events/:eventId/cancel-registration
+ * @desc    Cancel a single event registration (with refund calculation)
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @body    { registration_number: string, reason: string } (reason is optional)
+ * @returns { success, message, data: { registration_id, refund: { eligible, amount, percent } } }
+ * @note    Automatically promotes from waitlist if capacity opens up
+ */
+router.post('/events/:eventId/cancel-registration',
+  EventManagerController.cancelRegistration
+);
+
+/**
+ * @route   POST /api/event-manager/events/:eventId/bulk-cancel
+ * @desc    Bulk cancel multiple event registrations
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @body    { registration_numbers: string[], reason: string } OR Excel file with registration_number column
+ * @returns { success, message, data: { total, successful, failed, errors[] } }
+ * @note    Supports both JSON array and Excel file upload
+ * @example JSON: { "registration_numbers": ["REG001", "REG002"], "reason": "Event postponed" }
+ * @example Excel: File with columns: registration_number (required)
+ */
+router.post('/events/:eventId/bulk-cancel',
+  upload.single('file'),
+  handleUploadErrors,
+  EventManagerController.bulkCancelRegistrations
 );
 
 export default router;
