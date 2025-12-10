@@ -3,8 +3,8 @@ import { query } from '../config/db.js';
 
 const schools = [
   {
-    school_name: 'School of Computing Sciences and Engineering',
-    description: 'BTech CSE, BTech IT, BCA, MCA programs. Located in Block A'
+    school_name: 'School of Computing and IT',
+    description: 'Information Technology, Computing, BCA, MCA programs. Located in Block A1'
   },
   {
     school_name: 'School of Civil Engineering',

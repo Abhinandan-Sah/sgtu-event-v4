@@ -128,47 +128,115 @@ class StudentModel {
   }
 
   // Bulk insert students (for Excel import - 11k students)
-  static async bulkCreate(students, sql) {
-    if (!students || students.length === 0) return [];
-    
-    const batchSize = 500; // Insert 500 at a time for performance
-    const results = [];
-    
-    for (let i = 0; i < students.length; i += batchSize) {
-      const batch = students.slice(i, i + batchSize);
-      const values = [];
-      const placeholders = [];
-      
-      for (let j = 0; j < batch.length; j++) {
-        const offset = j * 7;
-        placeholders.push(
-          `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6})`
-        );
-        const hashedPassword = await StudentModel.hashPassword(batch[j].password);
-        values.push(
-          batch[j].registration_no,
-          batch[j].email,
-          hashedPassword,
-          batch[j].full_name,
-          batch[j].school_id,
-          batch[j].phone || null
-        );
+  // Enhanced version with all fields and transaction support
+  static async bulkCreate(students, sql, batchSize = 1000) {
+    if (!students || students.length === 0) {
+      return {
+        success: true,
+        inserted: 0,
+        failed: 0,
+        total: 0,
+        errors: [],
+      };
+    }
+
+    let insertedCount = 0;
+    let failedCount = 0;
+    const errors = [];
+
+    try {
+      // Start transaction
+      await sql('BEGIN');
+
+      // Process in batches
+      for (let i = 0; i < students.length; i += batchSize) {
+        const batch = students.slice(i, i + batchSize);
+        const values = [];
+        const placeholders = [];
+
+        // Prepare batch data with all fields
+        for (let j = 0; j < batch.length; j++) {
+          const student = batch[j];
+          const offset = j * 11; // 11 fields per student
+
+          placeholders.push(
+            `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11})`
+          );
+
+          // Hash password
+          const hashedPassword = await StudentModel.hashPassword(student.password);
+
+          values.push(
+            student.registration_no,
+            student.email || null,
+            hashedPassword,
+            student.full_name,
+            student.school_id,
+            student.phone || null,
+            student.date_of_birth || null,
+            student.pincode || null,
+            student.address || null,
+            student.program_name || null,
+            student.batch ? parseInt(student.batch, 10) : null
+          );
+        }
+
+        const query = `
+          INSERT INTO students (
+            registration_no, email, password_hash, full_name, school_id, 
+            phone, date_of_birth, pincode, address, program_name, batch,
+            role, is_inside_event, total_scan_count, feedback_count, 
+            has_completed_ranking, password_reset_required, created_at, updated_at
+          )
+          VALUES ${placeholders.map(
+            (p) =>
+              p.replace(
+                /\)/g,
+                ", 'STUDENT', false, 0, 0, false, true, NOW(), NOW())"
+              )
+          ).join(', ')}
+          ON CONFLICT (registration_no) DO NOTHING
+          RETURNING registration_no
+        `;
+
+        try {
+          const batchResults = await sql(query, values);
+          insertedCount += batchResults.length;
+
+          // Track skipped rows (duplicates)
+          const skippedCount = batch.length - batchResults.length;
+          if (skippedCount > 0) {
+            failedCount += skippedCount;
+            // Note: We can't identify exact rows that were skipped with ON CONFLICT DO NOTHING
+            // This is a limitation of the current approach
+          }
+        } catch (batchError) {
+          // If batch fails, record error
+          failedCount += batch.length;
+          errors.push({
+            batch: Math.floor(i / batchSize) + 1,
+            error: batchError.message,
+            affectedRows: `${i + 1}-${Math.min(i + batch.length, students.length)}`,
+          });
+          throw batchError; // Re-throw to trigger rollback
+        }
       }
 
-      const query = `
-        INSERT INTO students (
-          registration_no, email, password_hash, full_name, school_id, phone
-        )
-        VALUES ${placeholders.join(', ')}
-        ON CONFLICT (registration_no) DO NOTHING
-        RETURNING *
-      `;
-      
-      const batchResults = await sql(query, values);
-      results.push(...batchResults);
+      // Commit transaction
+      await sql('COMMIT');
+
+      return {
+        success: true,
+        inserted: insertedCount,
+        failed: failedCount,
+        total: students.length,
+        errors,
+      };
+    } catch (error) {
+      // Rollback transaction on error
+      await sql('ROLLBACK');
+      throw new Error(`Bulk insert failed: ${error.message}`);
     }
-    
-    return results.map(row => new StudentModel(row));
   }
 
   // Update student profile

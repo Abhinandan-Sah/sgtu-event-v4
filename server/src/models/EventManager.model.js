@@ -4,12 +4,40 @@ import bcrypt from 'bcryptjs';
 
 class EventManager {
   /**
+   * Generate default password for event managers
+   * Strategy: firstname@phonenumber (e.g., priya@9876543210)
+   * @param {Object} managerData - { full_name, phone }
+   * @returns {string} Generated password
+   */
+  static generateDefaultPassword(managerData) {
+    const firstName = managerData.full_name.split(' ')[0].toLowerCase();
+    const phone = managerData.phone || '0000000000';
+    return `${firstName}@${phone}`;
+  }
+
+  /**
    * Create new event manager (requires admin approval before active)
-   * @param {Object} managerData - { email, password, full_name, phone, organization }
-   * @returns {Promise<Object>} Created event manager
+   * @param {Object} managerData - { email, password, full_name, phone, school_id }
+   * @returns {Promise<Object>} Created event manager with generated_password if auto-generated
    */
   static async create(managerData) {
-    const { email, password, full_name, phone, organization } = managerData;
+    const { email, full_name, phone, school_id, organization } = managerData;
+    let { password } = managerData;
+
+    // Validate required fields
+    if (!school_id) {
+      throw new Error('school_id is required');
+    }
+
+    // Auto-generate password if not provided
+    let generatedPassword = null;
+    let passwordResetRequired = false;
+
+    if (!password || password.trim() === '') {
+      password = this.generateDefaultPassword({ full_name, phone });
+      generatedPassword = password;
+      passwordResetRequired = true;
+    }
 
     // Hash password
     const salt = await bcrypt.genSalt(12);
@@ -17,19 +45,26 @@ class EventManager {
 
     const result = await pool`
       INSERT INTO event_managers (
-        email, password_hash, full_name, phone, organization
+        email, password_hash, full_name, phone, school_id, organization, password_reset_required
       )
       VALUES (
-        ${email}, ${password_hash}, ${full_name}, ${phone || null}, ${organization || null}
+        ${email}, ${password_hash}, ${full_name}, ${phone || null}, ${school_id}, ${organization || null}, ${passwordResetRequired}
       )
       RETURNING 
-        id, email, full_name, phone, organization, role,
-        is_approved_by_admin, is_active, 
+        id, email, full_name, phone, school_id, organization, role,
+        is_approved_by_admin, is_active, password_reset_required,
         total_events_created, total_events_completed,
         created_at, updated_at
     `;
 
-    return result[0];
+    const eventManager = result[0];
+
+    // Include generated password in response if auto-generated
+    if (generatedPassword) {
+      eventManager.generated_password = generatedPassword;
+    }
+
+    return eventManager;
   }
 
   /**
@@ -81,7 +116,7 @@ class EventManager {
    * @returns {Promise<Object>}
    */
   static async update(managerId, updates) {
-    const allowedFields = ['full_name', 'phone', 'organization', 'password_hash'];
+    const allowedFields = ['full_name', 'phone', 'school_id', 'organization', 'password_hash'];
     const updateFields = {};
 
     for (const field of allowedFields) {
@@ -114,7 +149,7 @@ class EventManager {
        SET ${setClause}, updated_at = NOW()
        WHERE id = $1
        RETURNING 
-         id, email, full_name, phone, organization, role,
+         id, email, full_name, phone, school_id, role,
          is_approved_by_admin, is_active,
          total_events_created, total_events_completed,
          created_at, updated_at`,

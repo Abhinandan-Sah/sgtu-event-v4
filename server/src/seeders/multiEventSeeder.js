@@ -31,7 +31,7 @@ const EVENT_MANAGERS = [
     password: 'TechLead@123',
     full_name: 'Dr. Rajesh Kumar',
     phone: '9876543210',
-    organization: 'Computer Science Department',
+    school_name: 'School of Engineering', // Will be converted to school_id
     is_approved_by_admin: true,
     is_active: true,
   },
@@ -40,7 +40,7 @@ const EVENT_MANAGERS = [
     password: 'Culture@123',
     full_name: 'Prof. Priya Sharma',
     phone: '9876543211',
-    organization: 'Cultural Committee',
+    school_name: 'School of Arts', // Will be converted to school_id
     is_approved_by_admin: true,
     is_active: true,
   },
@@ -49,7 +49,7 @@ const EVENT_MANAGERS = [
     password: 'External@123',
     full_name: 'Amit Patel',
     phone: '9876543212',
-    organization: 'TechEvents India Pvt Ltd',
+    school_name: 'School of Management', // Will be converted to school_id
     is_approved_by_admin: false, // Pending approval
     is_active: true,
   },
@@ -251,6 +251,14 @@ async function seedEventManagers() {
     try {
       const passwordHash = await bcryptjs.hash(manager.password, 10);
       
+      // Get school_id from school_name
+      const schoolResult = await query('SELECT id FROM schools WHERE school_name = $1 LIMIT 1', [manager.school_name]);
+      if (!schoolResult || schoolResult.length === 0) {
+        logger.error(`   ❌ School not found: ${manager.school_name}`);
+        continue;
+      }
+      const schoolId = schoolResult[0].id;
+      
       // Get admin ID for approved managers (use first admin)
       let approvedByAdminId = null;
       let approvedAt = null;
@@ -265,21 +273,22 @@ async function seedEventManagers() {
       
       const result = await query(`
         INSERT INTO event_managers (
-          email, password_hash, full_name, phone, organization,
-          is_approved_by_admin, approved_by_admin_id, approved_at, is_active
+          email, password_hash, full_name, phone, school_id,
+          is_approved_by_admin, approved_by_admin_id, approved_at, is_active, password_reset_required
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id, email, full_name
       `, [
         manager.email,
         passwordHash,
         manager.full_name,
         manager.phone,
-        manager.organization,
+        schoolId,
         manager.is_approved_by_admin,
         approvedByAdminId,
         approvedAt,
         manager.is_active,
+        false, // password_reset_required = false for seeded accounts with known passwords
       ]);
       
       managerIds.push(result[0].id);

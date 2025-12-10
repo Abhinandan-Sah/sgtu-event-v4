@@ -2,6 +2,7 @@ import express from 'express';
 const router = express.Router();
 import rankingController from '../controllers/ranking.controller.js';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import { checkRankingsPublished } from '../middleware/rankingVisibility.js';
 
 /**
  * Ranking Routes
@@ -10,29 +11,32 @@ import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
  */
 
 // ============================================================
-// PUBLIC ROUTES (No authentication - anyone can view leaderboards)
+// PUBLIC ROUTES (Controlled visibility based on event status)
 // ============================================================
 
 /**
  * @route   GET /api/ranking/:eventId/stalls/top/:limit
  * @desc    Get top N stalls leaderboard for event
- * @access  Public
+ * @access  Public (if rankings published or event completed)
+ * @note    Visibility controlled by checkRankingsPublished middleware
  */
-router.get('/:eventId/stalls/top/:limit', rankingController.getTopRankings);
+router.get('/:eventId/stalls/top/:limit', checkRankingsPublished, rankingController.getTopRankings);
 
 /**
  * @route   GET /api/ranking/:eventId/students/top/:limit
  * @desc    Get top N students leaderboard for event
- * @access  Public
+ * @access  Public (if rankings published or event completed)
+ * @note    Visibility controlled by checkRankingsPublished middleware
  */
-router.get('/:eventId/students/top/:limit', rankingController.getTopStudents);
+router.get('/:eventId/students/top/:limit', checkRankingsPublished, rankingController.getTopStudents);
 
 /**
  * @route   GET /api/ranking/:eventId/schools/top/:limit
  * @desc    Get top N schools leaderboard for event (school competition)
- * @access  Public
+ * @access  Public (if rankings published or event completed)
+ * @note    Visibility controlled by checkRankingsPublished middleware
  */
-router.get('/:eventId/schools/top/:limit', rankingController.getTopSchools);
+router.get('/:eventId/schools/top/:limit', checkRankingsPublished, rankingController.getTopSchools);
 
 // ============================================================
 // STUDENT ROUTES (Submit and view rankings)

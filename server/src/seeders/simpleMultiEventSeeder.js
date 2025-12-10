@@ -15,7 +15,7 @@ const eventManagers = [
     password: 'TechLead@123',
     full_name: 'Dr. Rajesh Kumar',
     phone: '9876543210',
-    organization: 'Computer Science Department',
+    school_name: 'School of Engineering',
     is_approved_by_admin: true,
   },
   {
@@ -23,7 +23,7 @@ const eventManagers = [
     password: 'Culture@123',
     full_name: 'Prof. Priya Sharma',
     phone: '9876543211',
-    organization: 'Cultural Committee',
+    school_name: 'School of Arts',
     is_approved_by_admin: true,
   },
   {
@@ -31,7 +31,7 @@ const eventManagers = [
     password: 'External@123',
     full_name: 'Amit Patel',
     phone: '9876543212',
-    organization: 'TechEvents India Pvt Ltd',
+    school_name: 'School of Management',
     is_approved_by_admin: false,
   },
 ];
@@ -43,20 +43,30 @@ const managerIds = [];
 for (const manager of eventManagers) {
   try {
     const hashedPassword = await bcryptjs.hash(manager.password, 10);
+    
+    // Get school_id from school_name
+    const schoolResult = await query('SELECT id FROM schools WHERE school_name = $1 LIMIT 1', [manager.school_name]);
+    if (!schoolResult || schoolResult.length === 0) {
+      console.log(`   ⏭  Skipped: ${manager.full_name} (school not found: ${manager.school_name})`);
+      continue;
+    }
+    const schoolId = schoolResult[0].id;
+    
     const result = await query(`
       INSERT INTO event_managers (
-        email, password_hash, full_name, phone, organization, is_approved_by_admin, is_active
+        email, password_hash, full_name, phone, school_id, is_approved_by_admin, is_active, password_reset_required
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING id
     `, [
       manager.email,
       hashedPassword,
       manager.full_name,
       manager.phone,
-      manager.organization,
+      schoolId,
       manager.is_approved_by_admin,
       true,
+      false, // password_reset_required = false for seeded accounts
     ]);
     
     managerIds.push(result[0].id);

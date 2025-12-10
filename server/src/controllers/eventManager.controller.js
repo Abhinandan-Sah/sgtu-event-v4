@@ -1,5 +1,5 @@
 // Event Manager Controller - Event creation, volunteer assignment, analytics
-import { query } from '../config/db.js';
+import { pool, query } from '../config/db.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { successResponse, errorResponse, validationErrorResponse } from '../helpers/response.js';
@@ -11,8 +11,23 @@ import {
   EventVolunteerModel,
   EventRegistrationModel
 } from '../models/index.js';
+import EventRegistration from '../models/EventRegistration.model.js';
 import { logAuditEvent, AuditEventType } from '../utils/auditLogger.js';
 import { uploadEventBanner, uploadEventImage } from '../services/cloudinary.js';
+import {
+  parseEventRegistrationFile,
+  generateEventRegistrationTemplate,
+  validateEventRegistrationData
+} from '../utils/excelParser.js';
+import {
+  checkRateLimit,
+  validateEventEligibility,
+  validateAndFetchStudents,
+  checkExistingRegistrations,
+  checkCapacityLimit,
+  checkCumulativeLimit,
+  getEligibilityStatus
+} from '../services/bulkRegistrationService.js';
 
 class EventManagerController {
   /**
@@ -47,6 +62,40 @@ class EventManagerController {
         return errorResponse(res, 'Invalid credentials', 401);
       }
 
+      // Check if password reset is required
+      if (manager.password_reset_required) {
+        // Generate limited token for identity verification only
+        const limitedToken = jwt.sign(
+          {
+            id: manager.id,
+            email: manager.email,
+            role: manager.role,
+            limited_access: true
+          },
+          process.env.JWT_SECRET,
+          { expiresIn: '15m' }
+        );
+
+        // Set HTTP-only cookie (so frontend can use it automatically)
+        setAuthCookie(res, limitedToken);
+
+        return successResponse(
+          res,
+          {
+            token: limitedToken,
+            password_reset_required: true,
+            manager: {
+              id: manager.id,
+              email: manager.email,
+              full_name: manager.full_name
+            },
+            message: 'Password reset required. Please verify your identity first.'
+          },
+          'Login successful - verification required',
+          200
+        );
+      }
+
       // Generate JWT token
       const token = jwt.sign(
         {
@@ -61,6 +110,15 @@ class EventManagerController {
       // Set HTTP-only cookie
       setAuthCookie(res, token);
 
+      // Get school name if school_id exists
+      let schoolName = null;
+      if (manager.school_id) {
+        const schoolResult = await query('SELECT school_name FROM schools WHERE id = $1', [manager.school_id]);
+        if (schoolResult && schoolResult.length > 0) {
+          schoolName = schoolResult[0].school_name;
+        }
+      }
+
       return successResponse(
         res,
         {
@@ -68,7 +126,8 @@ class EventManagerController {
             id: manager.id,
             email: manager.email,
             full_name: manager.full_name,
-            organization: manager.organization,
+            school_id: manager.school_id,
+            school_name: schoolName,
             role: manager.role,
             is_approved_by_admin: manager.is_approved_by_admin,
             total_events_created: manager.total_events_created
@@ -100,6 +159,123 @@ class EventManagerController {
   }
 
   /**
+   * Verify event manager identity (phone + school_id)
+   * POST /api/event-manager/verify-identity
+   */
+  static async verifyIdentity(req, res) {
+    try {
+      const { phone, school_id } = req.body;
+
+      if (!phone || !school_id) {
+        return errorResponse(res, 'Phone number and school ID are required for verification', 400);
+      }
+
+      // Get event manager
+      const manager = await EventManagerModel.findById(req.user.id);
+      if (!manager) {
+        return errorResponse(res, 'Event manager not found', 404);
+      }
+
+      // Verify phone matches
+      if (manager.phone !== phone) {
+        return errorResponse(res, 'Phone number does not match our records', 401);
+      }
+
+      // Verify school_id matches
+      if (manager.school_id !== school_id) {
+        return errorResponse(res, 'School does not match our records', 401);
+      }
+
+      // Issue full access token after verification
+      const token = jwt.sign(
+        { 
+          id: manager.id, 
+          email: manager.email,
+          role: manager.role,
+          verified: true
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      setAuthCookie(res, token);
+
+      return successResponse(res, {
+        token,
+        verified: true,
+        message: 'Identity verified. You can now reset your password.'
+      }, 'Identity verified successfully');
+    } catch (error) {
+      console.error('Event manager identity verification error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Reset password after identity verification
+   * POST /api/event-manager/reset-password
+   */
+  static async resetPassword(req, res) {
+    try {
+      const { new_password } = req.body;
+
+      if (!new_password) {
+        return errorResponse(res, 'New password is required', 400);
+      }
+
+      // Validate password strength
+      if (new_password.length < 8) {
+        return errorResponse(res, 'Password must be at least 8 characters long', 400);
+      }
+
+      const hasUpperCase = /[A-Z]/.test(new_password);
+      const hasLowerCase = /[a-z]/.test(new_password);
+      const hasNumber = /[0-9]/.test(new_password);
+      const hasSpecialChar = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(new_password);
+
+      if (!hasUpperCase || !hasLowerCase || !hasNumber || !hasSpecialChar) {
+        return errorResponse(
+          res,
+          'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character',
+          400
+        );
+      }
+
+      // Check if user has verified identity
+      if (!req.user.verified && req.user.limited_access) {
+        return errorResponse(res, 'Please verify your identity first', 403);
+      }
+
+      // Update password
+      const salt = await bcrypt.genSalt(12);
+      const password_hash = await bcrypt.hash(new_password, salt);
+
+      await query(
+        'UPDATE event_managers SET password_hash = $1, password_reset_required = false, updated_at = NOW() WHERE id = $2',
+        [password_hash, req.user.id]
+      );
+
+      return successResponse(res, null, 'Password reset successfully. Please login with your new password.');
+    } catch (error) {
+      console.error('Event manager password reset error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Logout event manager
+   * POST /api/event-managers/logout
+   */
+  static async logoutOld(req, res) {
+    try {
+      clearAuthCookie(res);
+      return successResponse(res, null, 'Logged out successfully');
+    } catch (error) {
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
    * Get event manager profile
    * GET /api/event-managers/profile
    */
@@ -115,13 +291,23 @@ class EventManagerController {
       // Get stats
       const stats = await EventManagerModel.getStats(managerId);
 
+      // Get school name if school_id exists
+      let schoolName = null;
+      if (manager.school_id) {
+        const schoolResult = await query('SELECT school_name FROM schools WHERE id = $1', [manager.school_id]);
+        if (schoolResult && schoolResult.length > 0) {
+          schoolName = schoolResult[0].school_name;
+        }
+      }
+
       return successResponse(res, {
         manager: {
           id: manager.id,
           email: manager.email,
           full_name: manager.full_name,
           phone: manager.phone,
-          organization: manager.organization,
+          school_id: manager.school_id,
+          school_name: schoolName,
           role: manager.role,
           is_approved_by_admin: manager.is_approved_by_admin,
           approved_at: manager.approved_at,
@@ -495,11 +681,11 @@ class EventManagerController {
         return errorResponse(res, 'Unauthorized access to this event', 403);
       }
 
-      // Prevent updates if event is active or completed
-      if (['ACTIVE', 'COMPLETED', 'ARCHIVED'].includes(event.status)) {
+      // Prevent updates if event is approved, active, completed, or archived
+      if (['APPROVED', 'ACTIVE', 'COMPLETED', 'ARCHIVED'].includes(event.status)) {
         return errorResponse(
           res,
-          'Cannot update event that is active, completed, or archived',
+          'Cannot update event after admin approval. Only DRAFT and REJECTED events can be modified.',
           400
         );
       }
@@ -971,6 +1157,380 @@ class EventManagerController {
       }, 'Schools retrieved successfully');
     } catch (error) {
       console.error('Get schools error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  // ============================================================
+  // BULK REGISTRATION METHODS
+  // ============================================================
+
+  /**
+   * Check eligibility for bulk registration
+   * GET /api/event-manager/events/:eventId/bulk-register/check-eligibility
+   */
+  static async checkEligibility(req, res) {
+    try {
+      const { eventId } = req.params;
+      const managerId = req.user.id;
+
+      const eligibility = await getEligibilityStatus(eventId, managerId);
+
+      return successResponse(res, eligibility, 'Eligibility check completed');
+
+    } catch (error) {
+      console.error('Check eligibility error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Validate bulk registration file (pre-upload check)
+   * POST /api/event-manager/events/:eventId/bulk-register/validate
+   */
+  static async validateBulkRegistration(req, res) {
+    try {
+      const { eventId } = req.params;
+      const managerId = req.user.id;
+
+      if (!req.file) {
+        return errorResponse(res, 'No file uploaded', 400);
+      }
+
+    // Validate event eligibility
+    const { event } = await validateEventEligibility(eventId, managerId, 'EVENT_MANAGER');
+
+    // Parse Excel file
+    const parsed = await parseEventRegistrationFile(req.file.buffer);
+
+    if (parsed.errors.length > 0) {
+      return errorResponse(res, 'Excel file contains formatting errors', 400, {
+        errors: parsed.errors
+      });
+    }
+
+    // Validate registration numbers format
+    const validation = validateEventRegistrationData(parsed.registrationNumbers);
+
+    if (!validation.valid) {
+      return successResponse(res, {
+        valid: false,
+        errors: validation.errors,
+        totalRows: validation.totalRows
+      }, 'Validation completed with errors');
+    }
+
+    // Fetch students from any school (no restriction)
+    const { validStudents, invalidRegistrationNumbers } = 
+      await validateAndFetchStudents(validation.validRegistrationNumbers, null);      // Check existing registrations
+      const studentIds = validStudents.map(s => s.id);
+      const existingStudentIds = await checkExistingRegistrations(eventId, studentIds);
+
+      const duplicateCount = existingStudentIds.length;
+      const newRegistrations = validStudents.length - duplicateCount;
+
+      // Check if requires approval (>200)
+      const requiresApproval = newRegistrations > 200;
+
+      // Check capacity
+      const capacityCheck = checkCapacityLimit(event, newRegistrations, false);
+
+      return successResponse(res, {
+        valid: true,
+        summary: {
+          total_in_file: parsed.totalRows,
+          unique_in_file: parsed.uniqueCount,
+          duplicates_in_file: parsed.duplicateCount,
+          valid_students: validStudents.length,
+          invalid_students: invalidRegistrationNumbers.length,
+          already_registered: duplicateCount,
+          new_registrations: newRegistrations
+        },
+        requires_approval: requiresApproval,
+        capacity: {
+          current: event.current_registrations,
+          max: event.max_capacity,
+          after_upload: event.current_registrations + newRegistrations,
+          exceeds_capacity: !capacityCheck.allowed,
+          available_slots: capacityCheck.available_slots
+        },
+        errors: [
+          ...invalidRegistrationNumbers.map(regNo => ({
+            registration_no: regNo,
+            error: 'STUDENT_NOT_FOUND',
+            message: 'Student not found in system'
+          }))
+        ],
+        warnings: capacityCheck.allowed ? [] : [{
+          type: 'CAPACITY_WARNING',
+          message: capacityCheck.reason
+        }]
+      }, 'Validation completed successfully');
+
+    } catch (error) {
+      console.error('Validate bulk registration error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Bulk register students to event (with restrictions)
+   * POST /api/event-manager/events/:eventId/bulk-register
+   */
+  static async bulkRegisterStudents(req, res) {
+    const startTime = Date.now();
+
+    try {
+      const { eventId } = req.params;
+      const managerId = req.user.id;
+
+      if (!req.file) {
+        return errorResponse(res, 'No file uploaded', 400);
+      }
+
+      // Check rate limits
+      const rateLimitCheck = await checkRateLimit(managerId, 'EVENT_MANAGER');
+      if (!rateLimitCheck.allowed) {
+        return errorResponse(res, rateLimitCheck.reason, 429);
+      }
+
+    // Validate event eligibility (ownership + status check)
+    const { event } = await validateEventEligibility(eventId, managerId, 'EVENT_MANAGER');
+
+    // Parse Excel file
+    const parsed = await parseEventRegistrationFile(req.file.buffer);
+
+    if (parsed.errors.length > 0) {
+      return errorResponse(res, 'Excel file contains errors', 400, {
+        errors: parsed.errors.slice(0, 50)
+      });
+    }
+
+    // Validate data format
+    const validation = validateEventRegistrationData(parsed.registrationNumbers);
+
+    if (!validation.valid) {
+      return errorResponse(res, 'Validation failed', 422, {
+        errors: validation.errors.slice(0, 50)
+      });
+    }
+
+    // Fetch students from any school (no restriction)
+    const { validStudents, invalidRegistrationNumbers } = 
+      await validateAndFetchStudents(validation.validRegistrationNumbers, null);      if (validStudents.length === 0) {
+        return errorResponse(res, 'No valid students found in upload', 400);
+      }
+
+      // Check existing registrations
+      const studentIds = validStudents.map(s => s.id);
+      const existingStudentIds = await checkExistingRegistrations(eventId, studentIds);
+
+      // Filter out already registered students
+      const studentsToRegister = validStudents.filter(s => !existingStudentIds.includes(s.id));
+
+      if (studentsToRegister.length === 0) {
+        return errorResponse(res, 'All students are already registered for this event', 400);
+      }
+
+      // Check if requires approval (>200 students)
+      if (studentsToRegister.length > 200) {
+        // Create approval request
+        const studentData = studentsToRegister.map(s => ({
+          student_id: s.id,
+          registration_no: s.registration_no,
+          full_name: s.full_name
+        }));
+
+        // Create log entry (pending approval)
+        const logEntry = await pool`
+          INSERT INTO bulk_registration_logs (
+            event_id,
+            uploaded_by_user_id,
+            uploaded_by_role,
+            total_students_attempted,
+            file_name,
+            status
+          ) VALUES (
+            ${eventId},
+            ${managerId},
+            'EVENT_MANAGER',
+            ${parsed.totalRows},
+            ${req.file.originalname},
+            'PENDING_APPROVAL'
+          )
+          RETURNING id
+        `;
+
+        // Create approval request
+        const request = await pool`
+          INSERT INTO bulk_registration_requests (
+            event_id,
+            bulk_log_id,
+            requested_by_user_id,
+            requested_by_role,
+            total_count,
+            student_data
+          ) VALUES (
+            ${eventId},
+            ${logEntry[0].id},
+            ${managerId},
+            'EVENT_MANAGER',
+            ${studentsToRegister.length},
+            ${JSON.stringify(studentData)}
+          )
+          RETURNING id, expires_at
+        `;
+
+        return successResponse(res, {
+          request_submitted: true,
+          request_id: request[0].id,
+          total_count: studentsToRegister.length,
+          status: 'PENDING',
+          expires_at: request[0].expires_at,
+          message: 'Request submitted for admin approval (exceeds 200 student threshold)'
+        }, 'Request submitted for admin approval');
+      }
+
+      // Check capacity (event managers cannot bypass)
+      const capacityCheck = checkCapacityLimit(event, studentsToRegister.length, false);
+
+      if (!capacityCheck.allowed) {
+        return errorResponse(res, capacityCheck.reason, 400, {
+          capacity: {
+            max: event.max_capacity,
+            current: event.current_registrations,
+            requested: studentsToRegister.length,
+            available: capacityCheck.available_slots
+          }
+        });
+      }
+
+      // Check cumulative limit
+      const cumulativeCheck = await checkCumulativeLimit(eventId, managerId, studentsToRegister.length);
+
+      // Perform bulk registration
+      const bulkResult = await EventRegistration.bulkCreate(
+        studentsToRegister,
+        eventId,
+        event.event_type,
+        { skip_capacity_check: false }
+      );
+
+      // Prepare error details
+      const errorDetails = [];
+
+      invalidRegistrationNumbers.forEach(regNo => {
+        errorDetails.push({
+          registration_no: regNo,
+          error: 'STUDENT_NOT_FOUND',
+          message: 'Student not found in system'
+        });
+      });
+
+      existingStudentIds.forEach(studentId => {
+        const student = validStudents.find(s => s.id === studentId);
+        if (student) {
+          errorDetails.push({
+            registration_no: student.registration_no,
+            error: 'ALREADY_REGISTERED',
+            message: 'Student already registered for this event'
+          });
+        }
+      });
+
+      // Create log entry
+      const logEntry = await pool`
+        INSERT INTO bulk_registration_logs (
+          event_id,
+          uploaded_by_user_id,
+          uploaded_by_role,
+          total_students_attempted,
+          successful_registrations,
+          failed_registrations,
+          duplicate_registrations,
+          file_name,
+          status,
+          attention_required,
+          error_details
+        ) VALUES (
+          ${eventId},
+          ${managerId},
+          'EVENT_MANAGER',
+          ${parsed.totalRows},
+          ${bulkResult.inserted},
+          ${invalidRegistrationNumbers.length},
+          ${existingStudentIds.length},
+          ${req.file.originalname},
+          ${bulkResult.inserted > 0 ? 'COMPLETED' : 'FAILED'},
+          ${cumulativeCheck.attention_required},
+          ${JSON.stringify(errorDetails)}
+        )
+        RETURNING id
+      `;
+
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+      return successResponse(res, {
+        log_id: logEntry[0].id,
+        summary: {
+          total_attempted: parsed.totalRows,
+          successful: bulkResult.inserted,
+          failed: invalidRegistrationNumbers.length,
+          duplicates: existingStudentIds.length,
+          duration: `${duration} seconds`
+        },
+        errors: errorDetails.slice(0, 100)
+      }, 'Bulk registration completed');
+
+    } catch (error) {
+      console.error('Bulk register students error:', error);
+      return errorResponse(res, error.message, 500);
+    }
+  }
+
+  /**
+   * Download event registration template
+   * GET /api/event-manager/events/:eventId/bulk-register/template
+   */
+  static async downloadEventRegistrationTemplate(req, res) {
+    try {
+      const { eventId } = req.params;
+      const managerId = req.user.id;
+
+      // Validate event eligibility
+      const { event, school_id } = await validateEventEligibility(eventId, managerId, 'EVENT_MANAGER');
+
+      // Fetch school name
+      const schools = await pool`
+        SELECT school_name FROM schools WHERE id = ${school_id}
+      `;
+
+      // Get rate limit status
+      const rateLimit = await checkRateLimit(managerId, 'EVENT_MANAGER');
+
+      // Get upload stats
+      const stats = await pool`
+        SELECT COUNT(*) as count FROM bulk_registration_logs
+        WHERE uploaded_by_user_id = ${managerId}
+          AND created_at > NOW() - INTERVAL '24 hours'
+      `;
+
+      const buffer = await generateEventRegistrationTemplate({
+        event_name: event.event_name,
+        event_code: event.event_code,
+        max_capacity: event.max_capacity,
+        current_registrations: event.current_registrations,
+        school_name: schools[0]?.school_name || 'Unknown',
+        today_uploads: parseInt(stats[0].count) || 0,
+        cooldown_active: !rateLimit.allowed
+      });
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename=event-registration-template-${event.event_code}.xlsx`);
+      res.send(buffer);
+
+    } catch (error) {
+      console.error('Download template error:', error);
       return errorResponse(res, error.message, 500);
     }
   }

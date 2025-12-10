@@ -822,15 +822,305 @@ const getMyRanking = async (req, res, next) => {
   }
 };
 
+/**
+ * Get comprehensive ranking summary across all events (ADMIN ONLY)
+ * @route GET /api/admin/rankings/all
+ */
+const getAllEventsRankingsSummary = async (req, res, next) => {
+  try {
+    // Get all events with ranking data
+    const eventsQuery = `
+      SELECT 
+        e.id as event_id,
+        e.event_name,
+        e.event_code,
+        e.status,
+        e.start_date,
+        e.end_date,
+        COUNT(DISTINCT r.id) as total_rankings,
+        COUNT(DISTINCT r.student_id) as students_participated,
+        COUNT(DISTINCT r.stall_id) as stalls_ranked,
+        ROUND(
+          (COUNT(DISTINCT ser.student_id) * 100.0 / 
+          NULLIF((SELECT COUNT(DISTINCT student_id) FROM event_registrations WHERE event_id = e.id AND payment_status IN ('COMPLETED', 'NOT_REQUIRED')), 0)), 2
+        ) as completion_rate
+      FROM events e
+      LEFT JOIN rankings r ON r.event_id = e.id
+      LEFT JOIN student_event_rankings ser ON ser.event_id = e.id AND ser.has_completed_ranking = true
+      WHERE e.status IN ('APPROVED', 'ACTIVE', 'COMPLETED')
+      GROUP BY e.id, e.event_name, e.event_code, e.status, e.start_date, e.end_date
+      HAVING COUNT(DISTINCT r.id) > 0
+      ORDER BY e.start_date DESC
+    `;
+    
+    const events = await query(eventsQuery);
+    
+    // Get platform-wide stats
+    const platformStatsQuery = `
+      SELECT 
+        COUNT(DISTINCT e.id) as total_events_with_rankings,
+        COUNT(DISTINCT r.id) as total_rankings_submitted,
+        COUNT(DISTINCT r.student_id) as total_students_participated,
+        COUNT(DISTINCT r.stall_id) as total_stalls_ranked
+      FROM events e
+      INNER JOIN rankings r ON r.event_id = e.id
+      WHERE e.status IN ('APPROVED', 'ACTIVE', 'COMPLETED')
+    `;
+    
+    const platformStats = await query(platformStatsQuery);
+    
+    // Get top performers for each event
+    const rankingsByEvent = await Promise.all(events.map(async (event) => {
+      // Get top stall for this event
+      const topStallQuery = `
+        WITH stall_metrics AS (
+          SELECT 
+            st.id as stall_id,
+            st.stall_name,
+            sc.school_name,
+            COALESCE(st.rank_1_votes, 0) as rank_1_votes,
+            COALESCE(st.rank_2_votes, 0) as rank_2_votes,
+            COALESCE(st.rank_3_votes, 0) as rank_3_votes,
+            COUNT(DISTINCT f.id) as total_feedbacks,
+            COALESCE(AVG(f.rating), 0) as avg_rating,
+            COUNT(DISTINCT f.student_id) as unique_visitors
+          FROM stalls st
+          LEFT JOIN schools sc ON st.school_id = sc.id
+          LEFT JOIN feedbacks f ON st.id = f.stall_id AND f.event_id = $1
+          WHERE st.is_active = true AND st.event_id = $1
+          GROUP BY st.id, st.stall_name, sc.school_name, st.rank_1_votes, st.rank_2_votes, st.rank_3_votes
+        ),
+        normalized_scores AS (
+          SELECT 
+            *,
+            ((rank_1_votes * 5) + (rank_2_votes * 3) + (rank_3_votes * 1)) as ranking_points,
+            (avg_rating * 20) as rating_points,
+            (total_feedbacks * 0.1) as feedback_points,
+            (unique_visitors * 0.05) as visitor_points
+          FROM stall_metrics
+        ),
+        max_values AS (
+          SELECT 
+            GREATEST(MAX(ranking_points), 1) as max_ranking,
+            GREATEST(MAX(rating_points), 1) as max_rating,
+            GREATEST(MAX(feedback_points), 1) as max_feedback,
+            GREATEST(MAX(visitor_points), 1) as max_visitor
+          FROM normalized_scores
+        )
+        SELECT 
+          ns.stall_name,
+          ns.school_name,
+          (
+            ((ns.ranking_points / mv.max_ranking * 100) * 0.40) +
+            ((ns.rating_points / mv.max_rating * 100) * 0.35) +
+            ((ns.feedback_points / mv.max_feedback * 100) * 0.15) +
+            ((ns.visitor_points / mv.max_visitor * 100) * 0.10)
+          ) as final_score
+        FROM normalized_scores ns, max_values mv
+        WHERE (ns.total_feedbacks > 0 OR ns.rank_1_votes > 0 OR ns.rank_2_votes > 0 OR ns.rank_3_votes > 0)
+        ORDER BY final_score DESC
+        LIMIT 1
+      `;
+      const topStall = await query(topStallQuery, [event.event_id]);
+      
+      // Get top student for this event (simplified calculation)
+      const topStudentQuery = `
+        SELECT 
+          st.full_name,
+          sc.school_name,
+          COALESCE(
+            (EXTRACT(EPOCH FROM SUM(c.check_out_time - c.check_in_time)) / 3600 * 0.3) +
+            (COUNT(DISTINCT f.id) * 0.25) +
+            (COUNT(DISTINCT r.id) * 0.1),
+            0
+          ) as final_score
+        FROM students st
+        INNER JOIN event_registrations er ON st.id = er.student_id AND er.event_id = $1 AND er.payment_status IN ('COMPLETED', 'NOT_REQUIRED')
+        LEFT JOIN schools sc ON st.school_id = sc.id
+        LEFT JOIN check_in_out c ON c.student_id = st.id AND c.event_id = $1
+        LEFT JOIN feedbacks f ON f.student_id = st.id AND f.event_id = $1
+        LEFT JOIN rankings r ON r.student_id = st.id AND r.event_id = $1
+        GROUP BY st.id, st.full_name, sc.school_name
+        ORDER BY final_score DESC
+        LIMIT 1
+      `;
+      const topStudent = await query(topStudentQuery, [event.event_id]);
+      
+      return {
+        event_id: event.event_id,
+        event_name: event.event_name,
+        event_code: event.event_code,
+        status: event.status,
+        total_rankings: parseInt(event.total_rankings || 0),
+        students_participated: parseInt(event.students_participated || 0),
+        stalls_ranked: parseInt(event.stalls_ranked || 0),
+        completion_rate: `${event.completion_rate || 0}%`,
+        top_stall: topStall[0] ? {
+          stall_name: topStall[0].stall_name,
+          school_name: topStall[0].school_name,
+          final_score: parseFloat(topStall[0].final_score || 0).toFixed(2)
+        } : null,
+        top_student: topStudent[0] ? {
+          full_name: topStudent[0].full_name,
+          school_name: topStudent[0].school_name,
+          final_score: parseFloat(topStudent[0].final_score || 0).toFixed(2)
+        } : null
+      };
+    }));
+    
+    // Get most active event
+    const mostActiveEventQuery = `
+      SELECT 
+        e.event_name,
+        COUNT(DISTINCT r.id) as rankings_count
+      FROM events e
+      INNER JOIN rankings r ON r.event_id = e.id
+      WHERE e.status IN ('APPROVED', 'ACTIVE', 'COMPLETED')
+      GROUP BY e.id, e.event_name
+      ORDER BY rankings_count DESC
+      LIMIT 1
+    `;
+    const mostActiveEvent = await query(mostActiveEventQuery);
+    
+    // Get highest participation rate
+    const highestParticipationQuery = `
+      SELECT 
+        e.event_name,
+        ROUND(
+          (COUNT(DISTINCT ser.student_id) * 100.0 / 
+          NULLIF((SELECT COUNT(DISTINCT student_id) FROM event_registrations WHERE event_id = e.id AND payment_status IN ('COMPLETED', 'NOT_REQUIRED')), 0)), 2
+        ) as participation_rate
+      FROM events e
+      LEFT JOIN student_event_rankings ser ON ser.event_id = e.id AND ser.has_completed_ranking = true
+      WHERE e.status IN ('APPROVED', 'ACTIVE', 'COMPLETED')
+      GROUP BY e.id, e.event_name
+      HAVING COUNT(DISTINCT ser.student_id) > 0
+      ORDER BY participation_rate DESC
+      LIMIT 1
+    `;
+    const highestParticipation = await query(highestParticipationQuery);
+    
+    // Get top school across all events
+    const topSchoolAcrossEventsQuery = `
+      SELECT 
+        sc.school_name,
+        SUM(CASE WHEN st.school_id = sc.id THEN 
+          CASE r.rank
+            WHEN 1 THEN 5
+            WHEN 2 THEN 3
+            WHEN 3 THEN 1
+            ELSE 0
+          END
+        ELSE 0 END) as total_points
+      FROM schools sc
+      LEFT JOIN students s ON s.school_id = sc.id
+      LEFT JOIN student_event_rankings ser ON ser.student_id = s.id AND ser.has_completed_ranking = true
+      LEFT JOIN rankings r ON r.student_id = s.id
+      LEFT JOIN stalls st ON r.stall_id = st.id
+      LEFT JOIN events e ON r.event_id = e.id
+      WHERE e.status IN ('APPROVED', 'ACTIVE', 'COMPLETED')
+        AND ser.has_completed_ranking = true
+      GROUP BY sc.id, sc.school_name
+      ORDER BY total_points DESC
+      LIMIT 1
+    `;
+    const topSchool = await query(topSchoolAcrossEventsQuery);
+    
+    return successResponse(res, {
+      total_events_with_rankings: parseInt(platformStats[0]?.total_events_with_rankings || 0),
+      total_rankings_submitted: parseInt(platformStats[0]?.total_rankings_submitted || 0),
+      total_students_participated: parseInt(platformStats[0]?.total_students_participated || 0),
+      rankings_by_event: rankingsByEvent,
+      platform_stats: {
+        most_active_event: mostActiveEvent[0] ? {
+          event_name: mostActiveEvent[0].event_name,
+          rankings_count: parseInt(mostActiveEvent[0].rankings_count)
+        } : null,
+        highest_participation_rate: highestParticipation[0] ? {
+          event_name: highestParticipation[0].event_name,
+          percentage: `${highestParticipation[0].participation_rate}%`
+        } : null,
+        top_school_across_events: topSchool[0] ? {
+          school_name: topSchool[0].school_name,
+          total_points: parseInt(topSchool[0].total_points || 0)
+        } : null
+      }
+    }, 'Platform-wide ranking summary retrieved successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get rankings grouped by event (ADMIN ONLY)
+ * @route GET /api/admin/rankings/by-event
+ */
+const getRankingsByEvent = async (req, res, next) => {
+  try {
+    const queryText = `
+      SELECT 
+        e.id as event_id,
+        e.event_name,
+        e.event_code,
+        e.status,
+        e.start_date,
+        e.end_date,
+        COUNT(DISTINCT r.id) as total_rankings,
+        COUNT(DISTINCT r.student_id) as students_participated,
+        COUNT(DISTINCT r.stall_id) as stalls_ranked,
+        COUNT(DISTINCT CASE WHEN r.rank = 1 THEN r.id END) as rank_1_votes,
+        COUNT(DISTINCT CASE WHEN r.rank = 2 THEN r.id END) as rank_2_votes,
+        COUNT(DISTINCT CASE WHEN r.rank = 3 THEN r.id END) as rank_3_votes
+      FROM events e
+      LEFT JOIN rankings r ON r.event_id = e.id
+      WHERE e.status IN ('APPROVED', 'ACTIVE', 'COMPLETED')
+      GROUP BY e.id, e.event_name, e.event_code, e.status, e.start_date, e.end_date
+      HAVING COUNT(DISTINCT r.id) > 0
+      ORDER BY e.start_date DESC
+    `;
+    
+    const eventRankings = await query(queryText);
+    
+    return successResponse(res, {
+      events: eventRankings.map(event => ({
+        event_id: event.event_id,
+        event_name: event.event_name,
+        event_code: event.event_code,
+        status: event.status,
+        start_date: event.start_date,
+        end_date: event.end_date,
+        ranking_summary: {
+          total_rankings: parseInt(event.total_rankings || 0),
+          students_participated: parseInt(event.students_participated || 0),
+          stalls_ranked: parseInt(event.stalls_ranked || 0),
+          votes_breakdown: {
+            rank_1_votes: parseInt(event.rank_1_votes || 0),
+            rank_2_votes: parseInt(event.rank_2_votes || 0),
+            rank_3_votes: parseInt(event.rank_3_votes || 0)
+          }
+        }
+      })),
+      total_events: eventRankings.length
+    }, 'Rankings by event retrieved successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
 export default {
   getAllRankings,
   getRankingByStall,
   getTopRankings,
+  getTopStallRankings: getTopRankings,
+  getTopStudentRankings: getTopStudents,
   getTopStudents,
   getTopSchools,
   getMyRanking,
   updateRanking,
   calculateRankings,
   createRanking,
-  deleteRanking
+  deleteRanking,
+  // Admin cross-event methods
+  getAllEventsRankingsSummary,
+  getRankingsByEvent
 };

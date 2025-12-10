@@ -216,7 +216,7 @@ CREATE TRIGGER update_stalls_updated_at BEFORE UPDATE ON stalls
 -- ============================================
 INSERT INTO schools (school_name, description)
 VALUES 
-  ('School of Computer Science and Engineering', 'Computer Science, AI, Cybersecurity programs. Located in Block A'),
+  ('School of Computer Science and Engineering', 'Computer Science, AI, Cybersecurity, Software Engineering programs. Located in Block A'),
   ('School of Mechanical Engineering', 'Mechanical and Automotive Engineering programs. Located in Block B'),
   ('School of Civil Engineering', 'Civil and Construction Engineering programs. Located in Block C'),
   ('School of Electrical Engineering', 'Electrical and Electronics Engineering programs. Located in Block D')

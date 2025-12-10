@@ -6,11 +6,29 @@ import School from '../models/School.model.js';
 import CheckInOut from '../models/CheckInOut.model.js';
 import EventManagerModel from '../models/EventManager.model.js'; // ✅ Fixed: consistent naming
 import EventModel from '../models/Event.model.js'; // ✅ Fixed: consistent naming
+import EventRegistration from '../models/EventRegistration.model.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { successResponse, errorResponse } from '../helpers/response.js';
 import { setAuthCookie, clearAuthCookie } from '../helpers/cookie.js';
-import { query } from '../config/db.js';
+import { pool, query } from '../config/db.js';
+import { 
+  parseStudentFile, 
+  validateStudents, 
+  generateStudentTemplate,
+  exportStudentsToExcel,
+  parseEventRegistrationFile,
+  generateEventRegistrationTemplate,
+  validateEventRegistrationData
+} from '../utils/excelParser.js';
+import {
+  validateEventEligibility,
+  validateAndFetchStudents,
+  checkExistingRegistrations,
+  checkCapacityLimit,
+  checkCumulativeLimit
+} from '../services/bulkRegistrationService.js';
+import { sanitizeString } from '../middleware/sanitizer.js';
 
 /**
  * Admin Controller
@@ -172,205 +190,6 @@ const getAllStalls = async (req, res, next) => {
   }
 };
 
-/**
- * Get system statistics
- * @route GET /api/admin/stats
- */
-const getStats = async (req, res, next) => {
-  try {
-    const [students, volunteers, stalls] = await Promise.all([
-      Student.findAll(100, 0, query),
-      Volunteer.findAllActive(query),
-      Stall.findAll(query)
-    ]);
-
-    return successResponse(res, {
-      totalStudents: students.length,
-      totalVolunteers: volunteers.length,
-      totalStalls: stalls.length,
-      activeCheckIns: 0 // TODO: Implement check-in counting
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * Get top schools based on student rankings (Category 2 - ADMIN ONLY)
- * @route GET /api/admin/top-schools
- */
-const getTopSchools = async (req, res, next) => {
-  try {
-    const limit = parseInt(req.query.limit) || 10;
-
-    const queryText = `
-      SELECT 
-        sc.id as school_id,
-        sc.school_name,
-        COUNT(DISTINCT s.id) as total_students_ranked,
-        SUM(CASE WHEN st.school_id = sc.id THEN 
-          CASE r.rank
-            WHEN 1 THEN 5
-            WHEN 2 THEN 3
-            WHEN 3 THEN 1
-            ELSE 0
-          END
-        ELSE 0 END) as school_score,
-        SUM(CASE WHEN st.school_id = sc.id AND r.rank = 1 THEN 1 ELSE 0 END) as rank_1_count,
-        SUM(CASE WHEN st.school_id = sc.id AND r.rank = 2 THEN 1 ELSE 0 END) as rank_2_count,
-        SUM(CASE WHEN st.school_id = sc.id AND r.rank = 3 THEN 1 ELSE 0 END) as rank_3_count,
-        COUNT(DISTINCT CASE WHEN st.school_id = sc.id THEN st.id END) as ranked_stalls_count
-      FROM schools sc
-      LEFT JOIN students s ON s.school_id = sc.id AND s.has_completed_ranking = true
-      LEFT JOIN rankings r ON r.student_id = s.id
-      LEFT JOIN stalls st ON r.stall_id = st.id
-      WHERE s.has_completed_ranking = true
-      GROUP BY sc.id, sc.school_name
-      HAVING SUM(CASE WHEN st.school_id = sc.id THEN 
-        CASE r.rank
-          WHEN 1 THEN 5
-          WHEN 2 THEN 3
-          WHEN 3 THEN 1
-          ELSE 0
-        END
-      ELSE 0 END) > 0
-      ORDER BY school_score DESC, total_students_ranked DESC
-      LIMIT $1
-    `;
-
-    const topSchools = await query(queryText, [limit]);
-
-    // Get overall stats
-    const statsQuery = `
-      SELECT 
-        COUNT(DISTINCT s.id) as total_students_participated,
-        COUNT(DISTINCT sc.id) as total_schools_participated,
-        COUNT(DISTINCT st.id) as total_stalls_ranked
-      FROM students s
-      LEFT JOIN rankings r ON r.student_id = s.id
-      LEFT JOIN stalls st ON r.stall_id = st.id
-      LEFT JOIN schools sc ON s.school_id = sc.id
-      WHERE s.has_completed_ranking = true
-    `;
-
-    const stats = await query(statsQuery);
-
-    return successResponse(res, {
-      top_schools: topSchools.map((school, index) => ({
-        position: index + 1,
-        school_id: school.school_id,
-        school_name: school.school_name,
-        total_score: parseInt(school.school_score),
-        breakdown: {
-          rank_1_votes: parseInt(school.rank_1_count),
-          rank_2_votes: parseInt(school.rank_2_count),
-          rank_3_votes: parseInt(school.rank_3_count)
-        },
-        students_participated: parseInt(school.total_students_ranked),
-        stalls_ranked: parseInt(school.ranked_stalls_count)
-      })),
-      scoring_system: {
-        rank_1: '5 points',
-        rank_2: '3 points',
-        rank_3: '1 point',
-        description: 'Schools earn points when their stalls are ranked by students from their own school'
-      },
-      overall_stats: {
-        total_students_participated: parseInt(stats[0].total_students_participated),
-        total_schools_participated: parseInt(stats[0].total_schools_participated),
-        total_stalls_ranked: parseInt(stats[0].total_stalls_ranked)
-      }
-    }, 'Top schools retrieved successfully');
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * Get top-ranked stalls (Category 2 - ADMIN ONLY)
- * @route GET /api/admin/top-stalls
- */
-const getTopStalls = async (req, res, next) => {
-  try {
-    const limit = parseInt(req.query.limit) || 10;
-
-    const queryText = `
-      SELECT 
-        st.id as stall_id,
-        st.stall_number,
-        st.stall_name,
-        st.description,
-        st.location,
-        sc.id as school_id,
-        sc.school_name,
-        st.rank_1_votes,
-        st.rank_2_votes,
-        st.rank_3_votes,
-        st.weighted_score,
-        (st.rank_1_votes + st.rank_2_votes + st.rank_3_votes) as total_votes
-      FROM stalls st
-      LEFT JOIN schools sc ON st.school_id = sc.id
-      WHERE (st.rank_1_votes + st.rank_2_votes + st.rank_3_votes) > 0
-      ORDER BY st.weighted_score DESC, st.rank_1_votes DESC, st.stall_number ASC
-      LIMIT $1
-    `;
-
-    const topStalls = await query(queryText, [limit]);
-
-    // Get overall ranking stats
-    const statsQuery = `
-      SELECT 
-        COUNT(DISTINCT stall_id) as total_stalls_ranked,
-        SUM(CASE WHEN rank = 1 THEN 1 ELSE 0 END) as total_rank_1_votes,
-        SUM(CASE WHEN rank = 2 THEN 1 ELSE 0 END) as total_rank_2_votes,
-        SUM(CASE WHEN rank = 3 THEN 1 ELSE 0 END) as total_rank_3_votes,
-        COUNT(DISTINCT student_id) as total_students_voted
-      FROM rankings
-    `;
-
-    const stats = await query(statsQuery);
-
-    return successResponse(res, {
-      top_stalls: topStalls.map((stall, index) => ({
-        position: index + 1,
-        stall_id: stall.stall_id,
-        stall_number: stall.stall_number,
-        stall_name: stall.stall_name,
-        description: stall.description,
-        location: stall.location,
-        school: {
-          school_id: stall.school_id,
-          school_name: stall.school_name
-        },
-        ranking_stats: {
-          rank_1_votes: parseInt(stall.rank_1_votes),
-          rank_2_votes: parseInt(stall.rank_2_votes),
-          rank_3_votes: parseInt(stall.rank_3_votes),
-          total_votes: parseInt(stall.total_votes),
-          weighted_score: parseInt(stall.weighted_score)
-        }
-      })),
-      scoring_system: {
-        rank_1: '5 points',
-        rank_2: '3 points',
-        rank_3: '1 point',
-        formula: 'weighted_score = (rank_1_votes × 5) + (rank_2_votes × 3) + (rank_3_votes × 1)'
-      },
-      overall_stats: {
-        total_stalls_ranked: parseInt(stats[0].total_stalls_ranked),
-        total_students_voted: parseInt(stats[0].total_students_voted),
-        breakdown: {
-          rank_1_votes: parseInt(stats[0].total_rank_1_votes),
-          rank_2_votes: parseInt(stats[0].total_rank_2_votes),
-          rank_3_votes: parseInt(stats[0].total_rank_3_votes)
-        }
-      }
-    }, 'Top stalls retrieved successfully');
-  } catch (error) {
-    next(error);
-  }
-};
-
 // ============================================================
 // EVENT MANAGER & EVENT APPROVAL OPERATIONS (Multi-Event)
 // ============================================================
@@ -381,23 +200,18 @@ const getTopStalls = async (req, res, next) => {
  */
 const createEventManager = async (req, res, next) => {
   try {
-    let { full_name, email, password, phone, organization } = req.body;
+    let { full_name, email, password, phone, school_id, organization } = req.body;
     const adminId = req.user.id;
 
-    // Validation
-    if (!full_name || !email || !password || !phone) {
-      return errorResponse(res, 'Full name, email, password, and phone are required', 400);
+    // Validation - password is optional, school_id is required
+    if (!full_name || !email || !phone || !school_id) {
+      return errorResponse(res, 'Full name, email, phone, and school_id are required', 400);
     }
 
     // Sanitize full_name to prevent XSS
     full_name = full_name.trim().replace(/<[^>]*>/g, '');
     if (full_name.length === 0) {
       return errorResponse(res, 'Full name cannot be empty or contain only HTML tags', 400);
-    }
-
-    // Sanitize organization if provided
-    if (organization) {
-      organization = organization.trim().replace(/<[^>]*>/g, '');
     }
 
     // Validate phone number (10 digits)
@@ -412,51 +226,77 @@ const createEventManager = async (req, res, next) => {
       return errorResponse(res, 'Invalid email format', 400);
     }
 
-    // Validate password strength
-    if (password.length < 8) {
-      return errorResponse(res, 'Password must be at least 8 characters long', 400);
-    }
+    // Validate password strength if provided (optional now)
+    if (password && password.trim() !== '') {
+      if (password.length < 8) {
+        return errorResponse(res, 'Password must be at least 8 characters long', 400);
+      }
 
-    // Check password complexity
-    const hasUpperCase = /[A-Z]/.test(password);
-    const hasLowerCase = /[a-z]/.test(password);
-    const hasNumber = /[0-9]/.test(password);
-    const hasSpecialChar = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password);
+      // Check password complexity
+      const hasUpperCase = /[A-Z]/.test(password);
+      const hasLowerCase = /[a-z]/.test(password);
+      const hasNumber = /[0-9]/.test(password);
+      const hasSpecialChar = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password);
 
-    if (!hasUpperCase || !hasLowerCase || !hasNumber || !hasSpecialChar) {
-      return errorResponse(
-        res,
-        'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character',
-        400
-      );
+      if (!hasUpperCase || !hasLowerCase || !hasNumber || !hasSpecialChar) {
+        return errorResponse(
+          res,
+          'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character',
+          400
+        );
+      }
     }
 
     // Check if email already exists
-    const existingManager = await query(
-      'SELECT id FROM event_managers WHERE email = $1',
-      [email]
-    );
-    if (existingManager.length > 0) {
+    const existingManager = await EventManagerModel.findByEmail(email);
+    if (existingManager) {
       return errorResponse(res, 'Email already registered', 400);
     }
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+    // Create event manager using model (will auto-generate password if not provided)
+    const eventManager = await EventManagerModel.create({
+      full_name,
+      email,
+      password,
+      phone,
+      school_id,
+      organization
+    });
 
-    // Create event manager (pre-approved by admin)
-    const result = await query(
-      `INSERT INTO event_managers 
-       (full_name, email, password_hash, phone, organization, 
-        is_approved_by_admin, approved_by_admin_id, approved_at, is_active)
-       VALUES ($1, $2, $3, $4, $5, true, $6, NOW(), true)
-       RETURNING id, full_name, email, phone, organization, 
-                 is_approved_by_admin, is_active, created_at, approved_at`,
-      [full_name, email, hashedPassword, phone, organization || null, adminId]
+    // Update approval status (pre-approved by admin)
+    await query(
+      `UPDATE event_managers 
+       SET is_approved_by_admin = true, approved_by_admin_id = $1, approved_at = NOW(), is_active = true
+       WHERE id = $2`,
+      [adminId, eventManager.id]
     );
 
-    return successResponse(res, {
-      event_manager: result[0]
-    }, 'Event manager created successfully', 201);
+    // Prepare response
+    const responseData = {
+      event_manager: {
+        id: eventManager.id,
+        full_name: eventManager.full_name,
+        email: eventManager.email,
+        phone: eventManager.phone,
+        school_id: eventManager.school_id,
+        organization: eventManager.organization,
+        is_approved_by_admin: true,
+        is_active: true,
+        password_reset_required: eventManager.password_reset_required,
+        created_at: eventManager.created_at
+      }
+    };
+
+    // Include generated password in response if auto-generated
+    if (eventManager.generated_password) {
+      responseData.generated_password = eventManager.generated_password;
+    }
+
+    const message = eventManager.generated_password
+      ? `Event manager created successfully with default password: ${eventManager.generated_password}`
+      : 'Event manager created successfully';
+
+    return successResponse(res, responseData, message, 201);
   } catch (error) {
     next(error);
   }
@@ -476,7 +316,8 @@ const getEventManagerDetails = async (req, res, next) => {
         em.full_name,
         em.email,
         em.phone,
-        em.organization,
+        em.school_id,
+        s.school_name,
         em.is_approved_by_admin,
         em.is_active,
         em.created_at,
@@ -487,10 +328,11 @@ const getEventManagerDetails = async (req, res, next) => {
         COUNT(e.id) as total_events,
         SUM(CASE WHEN e.status = 'ACTIVE' THEN 1 ELSE 0 END) as active_events
       FROM event_managers em
+      LEFT JOIN schools s ON em.school_id = s.id
       LEFT JOIN events e ON em.id = e.created_by_manager_id
       LEFT JOIN admins a ON em.approved_by_admin_id = a.id
       WHERE em.id = $1
-      GROUP BY em.id, a.full_name`,
+      GROUP BY em.id, s.school_name, a.full_name`,
       [id]
     );
 
@@ -639,7 +481,8 @@ const getAllEventManagers = async (req, res, next) => {
         em.full_name,
         em.email,
         em.phone,
-        em.organization,
+        em.school_id,
+        s.school_name,
         em.is_approved_by_admin,
         em.is_active,
         em.created_at,
@@ -650,9 +493,10 @@ const getAllEventManagers = async (req, res, next) => {
         SUM(CASE WHEN e.status = 'ACTIVE' THEN 1 ELSE 0 END) as active_events,
         a.full_name as approved_by_name
       FROM event_managers em
+      LEFT JOIN schools s ON em.school_id = s.id
       LEFT JOIN events e ON em.id = e.created_by_manager_id
       LEFT JOIN admins a ON em.approved_by_admin_id = a.id
-      GROUP BY em.id, a.full_name
+      GROUP BY em.id, s.school_name, a.full_name
       ORDER BY em.created_at DESC
     `);
 
@@ -696,9 +540,11 @@ const getPendingEvents = async (req, res, next) => {
         e.created_at,
         em.full_name as event_manager_name,
         em.email as event_manager_email,
-        em.organization
+        em.school_id,
+        s.school_name
       FROM events e
       INNER JOIN event_managers em ON e.created_by_manager_id = em.id
+      LEFT JOIN schools s ON em.school_id = s.id
       WHERE e.status = 'PENDING_APPROVAL'
       ORDER BY e.created_at ASC
     `);
@@ -744,10 +590,12 @@ const getAllEvents = async (req, res, next) => {
         e.created_at,
         e.admin_approved_at,
         em.full_name as event_manager_name,
-        em.organization,
+        em.school_id,
+        s.school_name,
         a.full_name as approved_by_name
       FROM events e
       INNER JOIN event_managers em ON e.created_by_manager_id = em.id
+      LEFT JOIN schools s ON em.school_id = s.id
       LEFT JOIN admins a ON e.approved_by_admin_id = a.id
       WHERE 1=1
     `;
@@ -869,18 +717,20 @@ const getEventDetails = async (req, res, next) => {
         em.full_name as event_manager_name,
         em.email as event_manager_email,
         em.phone as event_manager_phone,
-        em.organization,
+        em.school_id,
+        s.school_name,
         a.full_name as approved_by_name,
         COUNT(DISTINCT er.id) as total_registrations,
         COUNT(DISTINCT CASE WHEN er.payment_status = 'COMPLETED' THEN er.id END) as paid_registrations,
         COUNT(DISTINCT ev.volunteer_id) as total_volunteers
       FROM events e
       INNER JOIN event_managers em ON e.created_by_manager_id = em.id
+      LEFT JOIN schools s ON em.school_id = s.id
       LEFT JOIN admins a ON e.approved_by_admin_id = a.id
       LEFT JOIN event_registrations er ON e.id = er.event_id
       LEFT JOIN event_volunteers ev ON e.id = ev.event_id
       WHERE e.id = $1
-      GROUP BY e.id, em.full_name, em.email, em.phone, em.organization, a.full_name
+      GROUP BY e.id, em.full_name, em.email, em.phone, em.school_id, s.school_name, a.full_name
     `, [id]);
 
     if (eventResult.length === 0) {
@@ -933,9 +783,11 @@ const getEventApprovalPreview = async (req, res, next) => {
         em.full_name as manager_name,
         em.email as manager_email,
         em.phone as manager_phone,
-        em.organization as manager_organization
+        em.school_id as manager_school_id,
+        s.school_name as manager_school_name
       FROM events e
       INNER JOIN event_managers em ON e.created_by_manager_id = em.id
+      LEFT JOIN schools s ON em.school_id = s.id
       WHERE e.id = $1
     `, [id]);
 
@@ -1257,6 +1109,1576 @@ const getAllSchools = async (req, res, next) => {
   }
 };
 
+// ============================================================
+// RANKING ROUTES (Multi-Event Support - Comprehensive Rankings)
+// ============================================================
+
+/**
+ * Get comprehensive ranking summary across all events
+ * @route GET /api/admin/rankings/all
+ */
+const getAllEventsRankingsSummary = async (req, res, next) => {
+  try {
+    const RankingController = await import('./ranking.controller.js');
+    return await RankingController.default.getAllEventsRankingsSummary(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get rankings grouped by event
+ * @route GET /api/admin/rankings/by-event
+ */
+const getRankingsByEvent = async (req, res, next) => {
+  try {
+    const RankingController = await import('./ranking.controller.js');
+    return await RankingController.default.getRankingsByEvent(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get stall rankings for specific event
+ * @route GET /api/admin/events/:eventId/rankings/stalls
+ */
+const getEventStallRankings = async (req, res, next) => {
+  try {
+    const RankingController = await import('./ranking.controller.js');
+    return await RankingController.default.getTopStallRankings(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get student rankings for specific event
+ * @route GET /api/admin/events/:eventId/rankings/students
+ */
+const getEventStudentRankings = async (req, res, next) => {
+  try {
+    const RankingController = await import('./ranking.controller.js');
+    return await RankingController.default.getTopStudentRankings(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get school rankings for specific event
+ * @route GET /api/admin/events/:eventId/rankings/schools
+ */
+const getEventSchoolRankings = async (req, res, next) => {
+  try {
+    const RankingController = await import('./ranking.controller.js');
+    return await RankingController.default.getTopSchools(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Publish event rankings (make visible to public)
+ * @route PATCH /api/admin/events/:id/publish-rankings
+ */
+const publishRankings = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Check if event exists
+    const event = await EventModel.findById(id);
+    if (!event) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    // Update rankings_published to TRUE (force show)
+    const updateQuery = `
+      UPDATE events 
+      SET rankings_published = TRUE,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING id, event_name, status, rankings_published
+    `;
+    
+    const result = await query(updateQuery, [id]);
+    const updatedEvent = result[0];
+
+    return successResponse(res, {
+      event_id: updatedEvent.id,
+      event_name: updatedEvent.event_name,
+      status: updatedEvent.status,
+      rankings_published: updatedEvent.rankings_published,
+      message: 'Rankings are now visible to the public'
+    }, 'Rankings published successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Unpublish event rankings (hide from public)
+ * @route PATCH /api/admin/events/:id/unpublish-rankings
+ */
+const unpublishRankings = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Check if event exists
+    const event = await EventModel.findById(id);
+    if (!event) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    // Update rankings_published to FALSE (force hide)
+    const updateQuery = `
+      UPDATE events 
+      SET rankings_published = FALSE,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING id, event_name, status, rankings_published
+    `;
+    
+    const result = await query(updateQuery, [id]);
+    const updatedEvent = result[0];
+
+    return successResponse(res, {
+      event_id: updatedEvent.id,
+      event_name: updatedEvent.event_name,
+      status: updatedEvent.status,
+      rankings_published: updatedEvent.rankings_published,
+      message: 'Rankings are now hidden from public view'
+    }, 'Rankings unpublished successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Reset rankings visibility to auto-mode (NULL)
+ * @route PATCH /api/admin/events/:id/reset-rankings-visibility
+ */
+const resetRankingsVisibility = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Check if event exists
+    const event = await EventModel.findById(id);
+    if (!event) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    // Update rankings_published to NULL (auto-logic)
+    const updateQuery = `
+      UPDATE events 
+      SET rankings_published = NULL,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING id, event_name, status, rankings_published
+    `;
+    
+    const result = await query(updateQuery, [id]);
+    const updatedEvent = result[0];
+
+    const autoStatus = updatedEvent.status === 'COMPLETED' 
+      ? 'Rankings will be visible (event completed)' 
+      : 'Rankings will be hidden until event completes';
+
+    return successResponse(res, {
+      event_id: updatedEvent.id,
+      event_name: updatedEvent.event_name,
+      status: updatedEvent.status,
+      rankings_published: updatedEvent.rankings_published,
+      auto_status: autoStatus,
+      message: 'Rankings visibility reset to automatic mode'
+    }, 'Rankings visibility reset successfully');
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ============================================================
+// STUDENT BULK UPLOAD CONTROLLERS
+// ============================================================
+
+/**
+ * Bulk upload students from Excel file
+ * @route POST /api/admin/students/bulk-upload
+ */
+const bulkUploadStudents = async (req, res, next) => {
+  const startTime = Date.now();
+
+  try {
+    // Validate file upload
+    if (!req.file) {
+      return errorResponse(res, 'No file uploaded. Please upload an Excel file (.xlsx or .xls)', 400);
+    }
+
+    if (!req.file.buffer || req.file.buffer.length === 0) {
+      return errorResponse(res, 'Uploaded file is empty', 400);
+    }
+
+    // Parse Excel file
+    let parsedData;
+    try {
+      parsedData = await parseStudentFile(req.file.buffer);
+    } catch (parseError) {
+      return errorResponse(res, `Failed to parse Excel file: ${parseError.message}`, 400);
+    }
+
+    const { students, totalRows } = parsedData;
+
+    if (totalRows === 0) {
+      return errorResponse(res, 'No student data found in Excel file', 400);
+    }
+
+    // Validate all students
+    const validationResult = validateStudents(students);
+
+    if (!validationResult.valid) {
+      return res.status(422).json({
+        success: false,
+        message: 'Validation failed. Please fix errors in Excel file and try again.',
+        data: {
+          totalRows: validationResult.totalRows,
+          validRows: validationResult.validRows,
+          invalidRows: validationResult.invalidRows,
+          errors: validationResult.errors.slice(0, 50), // Limit to first 50 errors
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Extract unique school IDs to validate
+    const uniqueSchoolIds = [...new Set(validationResult.validStudents.map((s) => s.school_id))];
+
+    // Validate school IDs exist in database
+    const schoolCheckQuery = `
+      SELECT id FROM schools WHERE id = ANY($1::uuid[])
+    `;
+    const existingSchools = await query(schoolCheckQuery, [uniqueSchoolIds]);
+    const existingSchoolIds = existingSchools.map((s) => s.id);
+
+    // Find invalid school IDs
+    const invalidSchoolIds = uniqueSchoolIds.filter(
+      (id) => !existingSchoolIds.includes(id)
+    );
+
+    if (invalidSchoolIds.length > 0) {
+      // Find rows with invalid school IDs
+      const invalidSchoolErrors = validationResult.validStudents
+        .filter((s) => invalidSchoolIds.includes(s.school_id))
+        .map((s) => ({
+          row: s._rowNumber,
+          field: 'school_id',
+          value: s.school_id,
+          error: 'School ID not found in database',
+        }));
+
+      return res.status(422).json({
+        success: false,
+        message: `Found ${invalidSchoolIds.length} invalid school ID(s). Please verify school IDs and try again.`,
+        data: {
+          totalRows: validationResult.totalRows,
+          invalidSchoolIds,
+          errors: invalidSchoolErrors.slice(0, 50),
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Sanitize student data and auto-generate passwords
+    const sanitizedStudents = validationResult.validStudents.map((student) => {
+      // Auto-generate password from date_of_birth + pincode
+      // Format: YYYYMMDD + pincode (e.g., 2005-05-15 + 110001 = 20050515110001)
+      const dobFormatted = student.date_of_birth.replace(/-/g, ''); // Remove dashes from YYYY-MM-DD
+      const autoPassword = dobFormatted + student.pincode;
+
+      return {
+        ...student,
+        full_name: sanitizeString(student.full_name),
+        email: student.email ? sanitizeString(student.email.toLowerCase()) : null,
+        password: autoPassword, // Auto-generated password
+        address: student.address ? sanitizeString(student.address) : null,
+        program_name: student.program_name ? sanitizeString(student.program_name) : null,
+      };
+    });
+
+    // Perform bulk insert
+    let bulkResult;
+    try {
+      bulkResult = await Student.bulkCreate(sanitizedStudents, query, 1000);
+    } catch (bulkError) {
+      return errorResponse(
+        res,
+        `Bulk upload failed: ${bulkError.message}`,
+        500
+      );
+    }
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+    return successResponse(
+      res,
+      {
+        totalRows: bulkResult.total,
+        successful: bulkResult.inserted,
+        failed: bulkResult.failed,
+        duration: `${duration} seconds`,
+        errors: bulkResult.errors,
+      },
+      `Successfully uploaded ${bulkResult.inserted} student(s)`
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Validate student Excel file without inserting to database
+ * @route POST /api/admin/students/validate-upload
+ */
+const validateStudentUpload = async (req, res, next) => {
+  try {
+    // Validate file upload
+    if (!req.file) {
+      return errorResponse(res, 'No file uploaded. Please upload an Excel file (.xlsx or .xls)', 400);
+    }
+
+    if (!req.file.buffer || req.file.buffer.length === 0) {
+      return errorResponse(res, 'Uploaded file is empty', 400);
+    }
+
+    // Parse Excel file
+    let parsedData;
+    try {
+      parsedData = await parseStudentFile(req.file.buffer);
+    } catch (parseError) {
+      return errorResponse(res, `Failed to parse Excel file: ${parseError.message}`, 400);
+    }
+
+    const { students, totalRows } = parsedData;
+
+    if (totalRows === 0) {
+      return errorResponse(res, 'No student data found in Excel file', 400);
+    }
+
+    // Validate all students
+    const validationResult = validateStudents(students);
+
+    // Extract unique school IDs to validate
+    const uniqueSchoolIds = [...new Set(students.map((s) => s.school_id).filter(Boolean))];
+
+    // Validate school IDs exist in database
+    const schoolCheckQuery = `
+      SELECT id FROM schools WHERE id = ANY($1::uuid[])
+    `;
+    const existingSchools = await query(schoolCheckQuery, [uniqueSchoolIds]);
+    const existingSchoolIds = existingSchools.map((s) => s.id);
+
+    // Find invalid school IDs
+    const invalidSchoolIds = uniqueSchoolIds.filter(
+      (id) => !existingSchoolIds.includes(id)
+    );
+
+    // Add school validation errors
+    if (invalidSchoolIds.length > 0) {
+      students.forEach((student) => {
+        if (invalidSchoolIds.includes(student.school_id)) {
+          const existingError = validationResult.errors.find(
+            (e) => e.row === student._rowNumber
+          );
+          if (existingError) {
+            existingError.errors.push({
+              field: 'school_id',
+              error: 'School ID not found in database',
+            });
+          } else {
+            validationResult.errors.push({
+              row: student._rowNumber,
+              errors: [
+                {
+                  field: 'school_id',
+                  error: 'School ID not found in database',
+                },
+              ],
+            });
+          }
+        }
+      });
+
+      validationResult.valid = false;
+      validationResult.invalidRows = validationResult.errors.length;
+      validationResult.validRows = totalRows - validationResult.errors.length;
+    }
+
+    // Return validation results
+    if (!validationResult.valid) {
+      return res.status(200).json({
+        success: true,
+        message: 'Validation completed with errors',
+        data: {
+          valid: false,
+          totalRows: validationResult.totalRows,
+          validRows: validationResult.validRows,
+          invalidRows: validationResult.invalidRows,
+          errors: validationResult.errors.slice(0, 100), // Return first 100 errors
+          summary: `Found ${validationResult.invalidRows} error(s) in ${validationResult.totalRows} row(s)`,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    return successResponse(
+      res,
+      {
+        valid: true,
+        totalRows: validationResult.totalRows,
+        validRows: validationResult.validRows,
+        message: 'All rows are valid! Ready to upload.',
+      },
+      'Validation successful'
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Download Excel template for student bulk upload
+ * @route GET /api/admin/students/upload-template
+ */
+const downloadStudentTemplate = async (req, res, next) => {
+  try {
+    // Generate template
+    const templateBuffer = await generateStudentTemplate();
+
+    // Set response headers for file download
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="student_upload_template.xlsx"'
+    );
+    res.setHeader('Content-Length', templateBuffer.length);
+
+    // Send file
+    res.send(templateBuffer);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Export all students data to Excel file
+ * @route GET /api/admin/students/export
+ */
+const exportStudents = async (req, res, next) => {
+  try {
+    // Get all students with school information
+    const studentsQuery = `
+      SELECT 
+        s.id,
+        s.registration_no,
+        s.email,
+        s.full_name,
+        s.phone,
+        s.date_of_birth,
+        s.pincode,
+        s.address,
+        s.program_name,
+        s.batch,
+        s.total_scan_count,
+        s.feedback_count,
+        s.is_inside_event,
+        s.total_events_registered,
+        s.created_at,
+        sc.school_name
+      FROM students s
+      LEFT JOIN schools sc ON s.school_id = sc.id
+      ORDER BY s.created_at DESC
+    `;
+
+    const students = await query(studentsQuery);
+
+    if (!students || students.length === 0) {
+      return errorResponse(res, 'No students found in database', 404);
+    }
+
+    // Generate Excel file
+    const excelBuffer = await exportStudentsToExcel(students);
+
+    // Create filename with timestamp
+    const timestamp = new Date().toISOString().split('T')[0];
+    const filename = `students_export_${timestamp}.xlsx`;
+
+    // Set response headers for file download
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', excelBuffer.length);
+
+    // Send file
+    res.send(excelBuffer);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ============================================================
+// EVENT BULK REGISTRATION CONTROLLERS
+// ============================================================
+
+/**
+ * Validate bulk registration file (pre-upload check)
+ * POST /api/admin/events/:eventId/bulk-register/validate
+ */
+const validateBulkRegistration = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+    const adminId = req.user.id;
+
+    if (!req.file) {
+      return errorResponse(res, 'No file uploaded', 400);
+    }
+
+    // Parse Excel file
+    const parsed = await parseEventRegistrationFile(req.file.buffer);
+
+    if (parsed.errors.length > 0) {
+      return errorResponse(res, 'Excel file contains formatting errors', 400, {
+        errors: parsed.errors
+      });
+    }
+
+    // Validate event
+    const { event } = await validateEventEligibility(eventId, null, 'ADMIN');
+
+    // Validate registration numbers
+    const validation = validateEventRegistrationData(parsed.registrationNumbers);
+
+    if (!validation.valid) {
+      return successResponse(res, {
+        valid: false,
+        errors: validation.errors,
+        totalRows: validation.totalRows
+      }, 'Validation completed with errors');
+    }
+
+    // Fetch students from database
+    const { validStudents, invalidRegistrationNumbers } = await validateAndFetchStudents(
+      validation.validRegistrationNumbers,
+      null // Admin can register from all schools
+    );
+
+    // Check existing registrations
+    const studentIds = validStudents.map(s => s.id);
+    const existingStudentIds = await checkExistingRegistrations(eventId, studentIds);
+
+    const duplicateCount = existingStudentIds.length;
+    const newRegistrations = validStudents.length - duplicateCount;
+
+    // Check capacity
+    const capacityCheck = checkCapacityLimit(event, newRegistrations, false);
+
+    return successResponse(res, {
+      valid: true,
+      summary: {
+        total_in_file: parsed.totalRows,
+        unique_in_file: parsed.uniqueCount,
+        duplicates_in_file: parsed.duplicateCount,
+        valid_students: validStudents.length,
+        invalid_students: invalidRegistrationNumbers.length,
+        already_registered: duplicateCount,
+        new_registrations: newRegistrations
+      },
+      capacity: {
+        current: event.current_registrations,
+        max: event.max_capacity,
+        after_upload: event.current_registrations + newRegistrations,
+        exceeds_capacity: !capacityCheck.allowed,
+        available_slots: capacityCheck.available_slots
+      },
+      errors: invalidRegistrationNumbers.map(regNo => ({
+        registration_no: regNo,
+        error: 'STUDENT_NOT_FOUND',
+        message: 'Student not found in system'
+      })),
+      warnings: capacityCheck.allowed ? [] : [{
+        type: 'CAPACITY_WARNING',
+        message: capacityCheck.reason
+      }]
+    }, 'Validation completed successfully');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Bulk register students to event
+ * POST /api/admin/events/:eventId/bulk-register
+ */
+const bulkRegisterStudents = async (req, res, next) => {
+  const startTime = Date.now();
+
+  try {
+    const { eventId } = req.params;
+    const adminId = req.user.id;
+    const bypassCapacity = req.body.bypass_capacity === 'true' || req.body.bypass_capacity === true;
+
+    if (!req.file) {
+      return errorResponse(res, 'No file uploaded', 400);
+    }
+
+    // Parse Excel file
+    const parsed = await parseEventRegistrationFile(req.file.buffer);
+
+    if (parsed.errors.length > 0) {
+      return errorResponse(res, 'Excel file contains errors', 400, {
+        errors: parsed.errors.slice(0, 50)
+      });
+    }
+
+    // Validate data format
+    const validation = validateEventRegistrationData(parsed.registrationNumbers);
+
+    if (!validation.valid) {
+      return errorResponse(res, 'Validation failed', 422, {
+        errors: validation.errors.slice(0, 50)
+      });
+    }
+
+    // Validate event
+    const { event } = await validateEventEligibility(eventId, null, 'ADMIN');
+
+    // Fetch students
+    const { validStudents, invalidRegistrationNumbers, schoolMismatches } = 
+      await validateAndFetchStudents(validation.validRegistrationNumbers, null);
+
+    if (validStudents.length === 0) {
+      return errorResponse(res, 'No valid students found in upload', 400);
+    }
+
+    // Check existing registrations
+    const studentIds = validStudents.map(s => s.id);
+    const existingStudentIds = await checkExistingRegistrations(eventId, studentIds);
+
+    // Filter out already registered students
+    const studentsToRegister = validStudents.filter(s => !existingStudentIds.includes(s.id));
+
+    if (studentsToRegister.length === 0) {
+      return errorResponse(res, 'All students are already registered for this event', 400);
+    }
+
+    // Check capacity
+    const capacityCheck = checkCapacityLimit(event, studentsToRegister.length, bypassCapacity);
+
+    if (!capacityCheck.allowed) {
+      return errorResponse(res, capacityCheck.reason, 400, {
+        capacity: {
+          max: event.max_capacity,
+          current: event.current_registrations,
+          requested: studentsToRegister.length,
+          available: capacityCheck.available_slots
+        }
+      });
+    }
+
+    // Check cumulative limit
+    const cumulativeCheck = await checkCumulativeLimit(eventId, adminId, studentsToRegister.length);
+
+    // Perform bulk registration
+    const bulkResult = await EventRegistration.bulkCreate(
+      studentsToRegister,
+      eventId,
+      event.event_type,
+      { skip_capacity_check: bypassCapacity }
+    );
+
+    // Prepare error details
+    const errorDetails = [];
+
+    invalidRegistrationNumbers.forEach(regNo => {
+      errorDetails.push({
+        registration_no: regNo,
+        error: 'STUDENT_NOT_FOUND',
+        message: 'Student not found in system'
+      });
+    });
+
+    existingStudentIds.forEach(studentId => {
+      const student = validStudents.find(s => s.id === studentId);
+      if (student) {
+        errorDetails.push({
+          registration_no: student.registration_no,
+          error: 'ALREADY_REGISTERED',
+          message: 'Student already registered for this event'
+        });
+      }
+    });
+
+    // Create log entry
+    const logEntry = await pool`
+      INSERT INTO bulk_registration_logs (
+        event_id,
+        uploaded_by_user_id,
+        uploaded_by_role,
+        total_students_attempted,
+        successful_registrations,
+        failed_registrations,
+        duplicate_registrations,
+        file_name,
+        status,
+        capacity_overridden,
+        attention_required,
+        error_details
+      ) VALUES (
+        ${eventId},
+        ${adminId},
+        'ADMIN',
+        ${parsed.totalRows},
+        ${bulkResult.inserted},
+        ${invalidRegistrationNumbers.length},
+        ${existingStudentIds.length},
+        ${req.file.originalname},
+        ${bulkResult.inserted > 0 ? 'COMPLETED' : 'FAILED'},
+        ${bypassCapacity},
+        ${cumulativeCheck.attention_required},
+        ${JSON.stringify(errorDetails)}
+      )
+      RETURNING id
+    `;
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+    return successResponse(res, {
+      log_id: logEntry[0].id,
+      summary: {
+        total_attempted: parsed.totalRows,
+        successful: bulkResult.inserted,
+        failed: invalidRegistrationNumbers.length,
+        duplicates: existingStudentIds.length,
+        duration: `${duration} seconds`
+      },
+      capacity_overridden: bypassCapacity,
+      errors: errorDetails.slice(0, 100)
+    }, 'Bulk registration completed');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Download event registration template
+ * GET /api/admin/events/:eventId/bulk-register/template
+ */
+const downloadEventRegistrationTemplate = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+
+    // Fetch event details
+    const events = await pool`
+      SELECT 
+        e.event_name,
+        e.event_code,
+        e.max_capacity,
+        e.current_registrations
+      FROM events e
+      WHERE e.id = ${eventId}
+    `;
+
+    if (events.length === 0) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    const event = events[0];
+
+    const buffer = await generateEventRegistrationTemplate({
+      event_name: event.event_name,
+      event_code: event.event_code,
+      max_capacity: event.max_capacity,
+      current_registrations: event.current_registrations
+    });
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=event-registration-template-${event.event_code}.xlsx`);
+    res.send(buffer);
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Download generic bulk registration template (no event required)
+ * GET /api/admin/bulk-register/template
+ */
+const downloadGenericBulkRegistrationTemplate = async (req, res, next) => {
+  try {
+    // Generate generic template without event-specific info
+    const buffer = await generateEventRegistrationTemplate();
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=Bulk_Registration_Template.xlsx');
+    res.send(buffer);
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get all bulk registration logs across all events
+ * GET /api/admin/bulk-register/logs
+ */
+const getAllBulkRegistrationLogs = async (req, res, next) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 20, 
+      event_id,
+      uploaded_by, 
+      uploaded_by_role,
+      from_date,
+      to_date,
+      include 
+    } = req.query;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    let conditions = [];
+    const params = [];
+    let paramCount = 1;
+
+    // Optional filters
+    if (event_id) {
+      conditions.push(`brl.event_id = $${paramCount}`);
+      params.push(event_id);
+      paramCount++;
+    }
+
+    if (uploaded_by) {
+      conditions.push(`brl.uploaded_by_user_id = $${paramCount}`);
+      params.push(uploaded_by);
+      paramCount++;
+    }
+
+    if (uploaded_by_role) {
+      conditions.push(`brl.uploaded_by_role = $${paramCount}`);
+      params.push(uploaded_by_role);
+      paramCount++;
+    }
+
+    if (from_date) {
+      conditions.push(`brl.created_at >= $${paramCount}`);
+      params.push(from_date);
+      paramCount++;
+    }
+
+    if (to_date) {
+      conditions.push(`brl.created_at <= $${paramCount}`);
+      params.push(to_date);
+      paramCount++;
+    }
+
+    const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    // Build select fields
+    const selectFields = include === 'errors' 
+      ? 'brl.*, e.event_name, e.event_code, ' +
+        'COALESCE(a.full_name, em.full_name) as uploaded_by_name, ' +
+        'COALESCE(a.email, em.email) as uploaded_by_email'
+      : 'brl.id, brl.event_id, e.event_name, e.event_code, brl.uploaded_by_user_id, ' +
+        'COALESCE(a.full_name, em.full_name) as uploaded_by_name, ' +
+        'COALESCE(a.email, em.email) as uploaded_by_email, ' +
+        'brl.uploaded_by_role, ' +
+        'brl.total_students_attempted, brl.successful_registrations, brl.failed_registrations, ' +
+        'brl.duplicate_registrations, brl.file_name, brl.created_at';
+
+    const queryText = `
+      SELECT 
+        ${selectFields},
+        COUNT(*) OVER() as total_count
+      FROM bulk_registration_logs brl
+      LEFT JOIN events e ON e.id = brl.event_id
+      LEFT JOIN admins a ON a.id = brl.uploaded_by_user_id AND brl.uploaded_by_role = 'ADMIN'
+      LEFT JOIN event_managers em ON em.id = brl.uploaded_by_user_id AND brl.uploaded_by_role = 'EVENT_MANAGER'
+      ${whereClause}
+      ORDER BY brl.created_at DESC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+    `;
+
+    params.push(parseInt(limit), offset);
+
+    const result = await pool(queryText, params);
+
+    // Database has UTC, convert to IST (UTC + 5:30)
+    const logsWithIST = result.map(log => ({
+      ...log,
+      created_at: log.created_at ? (() => {
+        const utcDate = new Date(log.created_at);
+        const istDate = new Date(utcDate.getTime() + (5.5 * 60 * 60 * 1000));
+        const year = istDate.getFullYear();
+        const month = String(istDate.getMonth() + 1).padStart(2, '0');
+        const day = String(istDate.getDate()).padStart(2, '0');
+        const hours = String(istDate.getHours()).padStart(2, '0');
+        const minutes = String(istDate.getMinutes()).padStart(2, '0');
+        const seconds = String(istDate.getSeconds()).padStart(2, '0');
+        return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} IST`;
+      })() : null
+    }));
+
+    return successResponse(res, {
+      logs: logsWithIST,
+      pagination: {
+        current_page: parseInt(page),
+        total_pages: Math.ceil((result[0]?.total_count || 0) / parseInt(limit)),
+        total_records: parseInt(result[0]?.total_count || 0),
+        limit: parseInt(limit)
+      }
+    }, 'All bulk registration logs retrieved');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get bulk registration logs for an event
+ * GET /api/admin/events/:eventId/bulk-register/logs
+ */
+const getBulkRegistrationLogs = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+    const { 
+      page = 1, 
+      limit = 20, 
+      uploaded_by, 
+      status,
+      include 
+    } = req.query;
+
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    let conditions = ['event_id = $1'];
+    const params = [eventId];
+    let paramCount = 2;
+
+    if (uploaded_by) {
+      conditions.push(`uploaded_by_user_id = $${paramCount}`);
+      params.push(uploaded_by);
+      paramCount++;
+    }
+
+    if (status) {
+      conditions.push(`status = $${paramCount}`);
+      params.push(status);
+      paramCount++;
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // Build select fields
+    const selectFields = include === 'errors' 
+      ? 'brl.*, error_details'
+      : 'brl.id, brl.event_id, brl.uploaded_by_user_id, brl.uploaded_by_role, ' +
+        'brl.total_students_attempted, brl.successful_registrations, brl.failed_registrations, ' +
+        'brl.duplicate_registrations, brl.file_name, brl.status, brl.capacity_overridden, ' +
+        'brl.attention_required, brl.created_at';
+
+    const queryText = `
+      SELECT 
+        ${selectFields},
+        COUNT(*) OVER() as total_count
+      FROM bulk_registration_logs brl
+      WHERE ${whereClause}
+      ORDER BY brl.created_at DESC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+    `;
+
+    params.push(parseInt(limit), offset);
+
+    const result = await pool(queryText, params);
+
+    // Database has UTC, convert to IST (UTC + 5:30)
+    const logsWithIST = result.map(log => ({
+      ...log,
+      created_at: log.created_at ? (() => {
+        const utcDate = new Date(log.created_at);
+        const istDate = new Date(utcDate.getTime() + (5.5 * 60 * 60 * 1000));
+        const year = istDate.getFullYear();
+        const month = String(istDate.getMonth() + 1).padStart(2, '0');
+        const day = String(istDate.getDate()).padStart(2, '0');
+        const hours = String(istDate.getHours()).padStart(2, '0');
+        const minutes = String(istDate.getMinutes()).padStart(2, '0');
+        const seconds = String(istDate.getSeconds()).padStart(2, '0');
+        return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} IST`;
+      })() : null
+    }));
+
+    return successResponse(res, {
+      logs: logsWithIST,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: result[0]?.total_count || 0,
+        totalPages: Math.ceil((result[0]?.total_count || 0) / parseInt(limit))
+      }
+    }, 'Bulk registration logs retrieved');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Export all bulk registration logs to CSV (across all events)
+ * GET /api/admin/bulk-register/logs/export
+ */
+const exportAllBulkRegistrationLogs = async (req, res, next) => {
+  try {
+    const { event_id, uploaded_by_role, from_date, to_date } = req.query;
+
+    let conditions = [];
+    const params = [];
+    let paramCount = 1;
+
+    if (event_id) {
+      conditions.push(`brl.event_id = $${paramCount}`);
+      params.push(event_id);
+      paramCount++;
+    }
+
+    if (uploaded_by_role) {
+      conditions.push(`brl.uploaded_by_role = $${paramCount}`);
+      params.push(uploaded_by_role);
+      paramCount++;
+    }
+
+    if (from_date) {
+      conditions.push(`brl.created_at >= $${paramCount}`);
+      params.push(from_date);
+      paramCount++;
+    }
+
+    if (to_date) {
+      conditions.push(`brl.created_at <= $${paramCount}`);
+      params.push(to_date);
+      paramCount++;
+    }
+
+    const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    const queryText = `
+      SELECT 
+        brl.id,
+        e.event_name,
+        e.event_code,
+        brl.uploaded_by_user_id,
+        COALESCE(a.full_name, em.full_name) as uploaded_by_name,
+        COALESCE(a.email, em.email) as uploaded_by_email,
+        brl.uploaded_by_role,
+        brl.total_students_attempted,
+        brl.successful_registrations,
+        brl.failed_registrations,
+        brl.duplicate_registrations,
+        brl.file_name,
+        brl.created_at
+      FROM bulk_registration_logs brl
+      LEFT JOIN events e ON e.id = brl.event_id
+      LEFT JOIN admins a ON a.id = brl.uploaded_by_user_id AND brl.uploaded_by_role = 'ADMIN'
+      LEFT JOIN event_managers em ON em.id = brl.uploaded_by_user_id AND brl.uploaded_by_role = 'EVENT_MANAGER'
+      ${whereClause}
+      ORDER BY brl.created_at DESC
+    `;
+
+    const logs = await pool(queryText, params);
+
+    if (logs.length === 0) {
+      return errorResponse(res, 'No bulk registration logs found', 404);
+    }
+
+    const headers = [
+      'Log ID',
+      'Event Name',
+      'Event Code',
+      'Uploaded By User ID',
+      'Uploaded By Name',
+      'Uploaded By Email',
+      'Uploaded By Role',
+      'Total Attempted',
+      'Successful',
+      'Failed',
+      'Duplicates',
+      'File Name',
+      'Created At (IST)'
+    ];
+
+    const csvRows = [headers.join(',')];
+
+    logs.forEach(log => {
+      // Database has UTC, convert to IST (UTC + 5:30)
+      const utcDate = new Date(log.created_at);
+      const istDate = new Date(utcDate.getTime() + (5.5 * 60 * 60 * 1000));
+      const year = istDate.getFullYear();
+      const month = String(istDate.getMonth() + 1).padStart(2, '0');
+      const day = String(istDate.getDate()).padStart(2, '0');
+      const hours = String(istDate.getHours()).padStart(2, '0');
+      const minutes = String(istDate.getMinutes()).padStart(2, '0');
+      const seconds = String(istDate.getSeconds()).padStart(2, '0');
+      const istString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds} IST`;
+      
+      const row = [
+        log.id,
+        `"${log.event_name || 'N/A'}"`,
+        log.event_code || 'N/A',
+        log.uploaded_by_user_id,
+        `"${log.uploaded_by_name || 'Unknown'}"`,
+        log.uploaded_by_email || 'N/A',
+        log.uploaded_by_role,
+        log.total_students_attempted,
+        log.successful_registrations,
+        log.failed_registrations,
+        log.duplicate_registrations,
+        `"${log.file_name || ''}"`,
+        istString
+      ];
+      csvRows.push(row.join(','));
+    });
+
+    const csv = csvRows.join('\n');
+    const filename = `all_bulk_registration_logs_${new Date().toISOString().split('T')[0]}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+    res.send(csv);
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Export bulk registration logs to CSV
+ * GET /api/admin/events/:eventId/bulk-register/logs/export
+ */
+const exportBulkRegistrationLogs = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+
+    const logs = await pool`
+      SELECT 
+        brl.id,
+        brl.uploaded_by_user_id,
+        COALESCE(a.full_name, em.full_name) as uploaded_by_name,
+        COALESCE(a.email, em.email) as uploaded_by_email,
+        brl.uploaded_by_role,
+        brl.total_students_attempted,
+        brl.successful_registrations,
+        brl.failed_registrations,
+        brl.duplicate_registrations,
+        brl.file_name,
+        brl.status,
+        brl.capacity_overridden,
+        brl.attention_required,
+        brl.created_at
+      FROM bulk_registration_logs brl
+      LEFT JOIN admins a ON a.id = brl.uploaded_by_user_id AND brl.uploaded_by_role = 'ADMIN'
+      LEFT JOIN event_managers em ON em.id = brl.uploaded_by_user_id AND brl.uploaded_by_role = 'EVENT_MANAGER'
+      WHERE brl.event_id = ${eventId}
+      ORDER BY brl.created_at DESC
+    `;
+
+    // Generate CSV
+    const headers = [
+      'Log ID', 'Uploaded By User ID', 'Uploaded By Name', 'Uploaded By Email', 'Role',
+      'Total Attempted', 'Successful', 'Failed', 
+      'Duplicates', 'File Name', 'Status', 'Capacity Overridden', 
+      'Attention Required', 'Created At (IST)'
+    ];
+
+    const csvRows = [headers.join(',')];
+
+    logs.forEach(log => {
+      // Database has UTC, convert to IST (UTC + 5:30)
+      const utcDate = new Date(log.created_at);
+      const istDate = new Date(utcDate.getTime() + (5.5 * 60 * 60 * 1000));
+      const year = istDate.getFullYear();
+      const month = String(istDate.getMonth() + 1).padStart(2, '0');
+      const day = String(istDate.getDate()).padStart(2, '0');
+      const hours = String(istDate.getHours()).padStart(2, '0');
+      const minutes = String(istDate.getMinutes()).padStart(2, '0');
+      const seconds = String(istDate.getSeconds()).padStart(2, '0');
+      const istString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds} IST`;
+      
+      const row = [
+        log.id,
+        log.uploaded_by_user_id,
+        `"${log.uploaded_by_name || 'Unknown'}"`,
+        log.uploaded_by_email || 'N/A',
+        log.uploaded_by_role,
+        log.total_students_attempted,
+        log.successful_registrations,
+        log.failed_registrations,
+        log.duplicate_registrations,
+        `"${log.file_name || ''}"`,
+        log.status,
+        log.capacity_overridden,
+        log.attention_required,
+        istString
+      ];
+      csvRows.push(row.join(','));
+    });
+
+    const csv = csvRows.join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=bulk-registration-logs.csv');
+    res.send(csv);
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get pending bulk registration requests (>200 students)
+ * GET /api/admin/bulk-registrations/pending
+ */
+const getPendingBulkRegistrations = async (req, res, next) => {
+  try {
+    const { event_id, sort_by = 'created_at' } = req.query;
+
+    let conditions = ["status = 'PENDING'"];
+    const params = [];
+    let paramCount = 1;
+
+    if (event_id) {
+      conditions.push(`brr.event_id = $${paramCount}`);
+      params.push(event_id);
+      paramCount++;
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // Determine sort order
+    let orderBy = 'brr.created_at DESC';
+    if (sort_by === 'urgency') {
+      orderBy = 'EXTRACT(EPOCH FROM (brr.expires_at - NOW())) ASC, brr.total_count DESC';
+    } else if (sort_by === 'oldest') {
+      orderBy = 'brr.created_at ASC';
+    } else if (sort_by === 'largest') {
+      orderBy = 'brr.total_count DESC';
+    }
+
+    const queryText = `
+      SELECT 
+        brr.id,
+        brr.event_id,
+        brr.requested_by_user_id,
+        brr.requested_by_role,
+        brr.total_count,
+        brr.status,
+        brr.expires_at,
+        brr.created_at,
+        e.event_name,
+        e.event_code,
+        e.max_capacity,
+        e.current_registrations,
+        em.full_name as requester_name,
+        em.email as requester_email,
+        EXTRACT(EPOCH FROM (brr.expires_at - NOW())) / 3600 as expires_in_hours
+      FROM bulk_registration_requests brr
+      JOIN events e ON brr.event_id = e.id
+      JOIN event_managers em ON brr.requested_by_user_id = em.id
+      WHERE ${whereClause}
+      ORDER BY ${orderBy}
+    `;
+
+    const requests = await pool(queryText, params);
+
+    // Calculate summary
+    const summary = {
+      total_pending: requests.length,
+      total_students: requests.reduce((sum, r) => sum + r.total_count, 0),
+      expiring_soon: requests.filter(r => r.expires_in_hours < 24).length
+    };
+
+    return successResponse(res, {
+      pending_requests: requests,
+      summary
+    }, 'Pending bulk registration requests retrieved');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Approve bulk registration request
+ * POST /api/admin/bulk-registrations/:requestId/approve
+ */
+const approveBulkRegistration = async (req, res, next) => {
+  try {
+    const { requestId } = req.params;
+    const adminId = req.user.id;
+
+    // Fetch request
+    const requests = await pool`
+      SELECT * FROM bulk_registration_requests
+      WHERE id = ${requestId}
+    `;
+
+    if (requests.length === 0) {
+      return errorResponse(res, 'Request not found', 404);
+    }
+
+    const request = requests[0];
+
+    // Check if already processed
+    if (request.status !== 'PENDING') {
+      return errorResponse(res, `Request already ${request.status.toLowerCase()}`, 409);
+    }
+
+    // Update request status to PROCESSING
+    await pool`
+      UPDATE bulk_registration_requests
+      SET 
+        status = 'PROCESSING',
+        processing_started_at = NOW(),
+        updated_at = NOW()
+      WHERE id = ${requestId}
+    `;
+
+    // Fetch event
+    const events = await pool`
+      SELECT * FROM events WHERE id = ${request.event_id}
+    `;
+
+    if (events.length === 0) {
+      await pool`
+        UPDATE bulk_registration_requests
+        SET status = 'EXPIRED', updated_at = NOW()
+        WHERE id = ${requestId}
+      `;
+      return errorResponse(res, 'Event not found or deleted', 404);
+    }
+
+    const event = events[0];
+
+    // Parse student data
+    const studentData = request.student_data;
+    const studentIds = studentData.map(s => s.student_id);
+
+    // Fetch students
+    const students = await pool`
+      SELECT id, registration_no, full_name FROM students
+      WHERE id = ANY(${studentIds})
+    `;
+
+    // Perform bulk registration
+    const bulkResult = await EventRegistration.bulkCreate(
+      students,
+      request.event_id,
+      event.event_type,
+      { skip_capacity_check: false }
+    );
+
+    // Update request as approved
+    await pool`
+      UPDATE bulk_registration_requests
+      SET 
+        status = 'APPROVED',
+        approved_by_admin_id = ${adminId},
+        approved_at = NOW(),
+        processing_completed_at = NOW(),
+        updated_at = NOW()
+      WHERE id = ${requestId}
+    `;
+
+    // Update log entry
+    if (request.bulk_log_id) {
+      await pool`
+        UPDATE bulk_registration_logs
+        SET 
+          status = 'COMPLETED',
+          successful_registrations = ${bulkResult.inserted},
+          duplicate_registrations = ${bulkResult.duplicates},
+          updated_at = NOW()
+        WHERE id = ${request.bulk_log_id}
+      `;
+    }
+
+    return successResponse(res, {
+      request_id: requestId,
+      status: 'APPROVED',
+      processed: {
+        total_attempted: request.total_count,
+        successful: bulkResult.inserted,
+        duplicates: bulkResult.duplicates,
+        failed: bulkResult.failed
+      }
+    }, 'Bulk registration approved and processed');
+
+  } catch (error) {
+    // Rollback request status on error
+    try {
+      await pool`
+        UPDATE bulk_registration_requests
+        SET status = 'PENDING', updated_at = NOW()
+        WHERE id = ${req.params.requestId}
+      `;
+    } catch (rollbackError) {
+      console.error('Failed to rollback request status:', rollbackError);
+    }
+    next(error);
+  }
+};
+
+/**
+ * Reject bulk registration request
+ * POST /api/admin/bulk-registrations/:requestId/reject
+ */
+const rejectBulkRegistration = async (req, res, next) => {
+  try {
+    const { requestId } = req.params;
+    const adminId = req.user.id;
+    const { rejection_reason_code, rejection_reason_text } = req.body;
+
+    if (!rejection_reason_text || rejection_reason_text.trim().length < 10) {
+      return errorResponse(res, 'Rejection reason must be at least 10 characters', 400);
+    }
+
+    // Fetch request
+    const requests = await pool`
+      SELECT * FROM bulk_registration_requests
+      WHERE id = ${requestId}
+    `;
+
+    if (requests.length === 0) {
+      return errorResponse(res, 'Request not found', 404);
+    }
+
+    const request = requests[0];
+
+    // Check if already processed
+    if (request.status !== 'PENDING') {
+      return errorResponse(res, `Request already ${request.status.toLowerCase()}`, 409);
+    }
+
+    // Update request as rejected
+    await pool`
+      UPDATE bulk_registration_requests
+      SET 
+        status = 'REJECTED',
+        rejected_by_admin_id = ${adminId},
+        rejected_at = NOW(),
+        rejection_reason_code = ${rejection_reason_code || 'CUSTOM'},
+        rejection_reason_text = ${rejection_reason_text},
+        updated_at = NOW()
+      WHERE id = ${requestId}
+    `;
+
+    // Update log entry
+    if (request.bulk_log_id) {
+      await pool`
+        UPDATE bulk_registration_logs
+        SET 
+          status = 'FAILED',
+          updated_at = NOW()
+        WHERE id = ${request.bulk_log_id}
+      `;
+    }
+
+    return successResponse(res, {
+      request_id: requestId,
+      status: 'REJECTED',
+      rejection_details: {
+        reason_code: rejection_reason_code || 'CUSTOM',
+        reason_text: rejection_reason_text
+      }
+    }, 'Bulk registration request rejected');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update event capacity
+ * PATCH /api/admin/events/:eventId/capacity
+ */
+const updateEventCapacity = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+    const { max_capacity, force = false } = req.body;
+
+    if (!max_capacity || max_capacity < 0) {
+      return errorResponse(res, 'Valid max_capacity is required (must be >= 0)', 400);
+    }
+
+    // Fetch event
+    const events = await pool`
+      SELECT * FROM events WHERE id = ${eventId}
+    `;
+
+    if (events.length === 0) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+
+    const event = events[0];
+
+    // Check if reducing below current registrations
+    if (max_capacity < event.current_registrations && !force) {
+      return res.status(409).json({
+        success: false,
+        message: 'New capacity is below current registrations',
+        data: {
+          requested_capacity: max_capacity,
+          current_registrations: event.current_registrations,
+          over_capacity_by: event.current_registrations - max_capacity,
+          warning: 'This will create over-capacity situation',
+          action_required: 'Set force=true to confirm'
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // Update capacity
+    await pool`
+      UPDATE events
+      SET 
+        max_capacity = ${max_capacity},
+        updated_at = NOW()
+      WHERE id = ${eventId}
+    `;
+
+    const updated = await pool`
+      SELECT id, event_name, max_capacity, current_registrations
+      FROM events WHERE id = ${eventId}
+    `;
+
+    return successResponse(res, {
+      event: updated[0],
+      change_log: {
+        old_capacity: event.max_capacity,
+        new_capacity: max_capacity,
+        changed_by: req.user.id,
+        changed_at: new Date().toISOString()
+      }
+    }, 'Event capacity updated successfully');
+
+  } catch (error) {
+    next(error);
+  }
+};
+
 export default {
   login,
   logout,
@@ -1266,9 +2688,6 @@ export default {
   getAllVolunteers,
   getAllStalls,
   getAllSchools,
-  getStats,
-  getTopSchools,
-  getTopStalls,
   // Multi-Event Support - Event Manager CRUD
   createEventManager,
   getEventManagerDetails,
@@ -1282,5 +2701,33 @@ export default {
   rejectEvent,
   getEventDetails,
   getEventApprovalPreview,
-  getEventAnalytics
+  getEventAnalytics,
+  // Multi-Event Support - Comprehensive Rankings
+  getAllEventsRankingsSummary,
+  getRankingsByEvent,
+  getEventStallRankings,
+  getEventStudentRankings,
+  getEventSchoolRankings,
+  // Ranking Visibility Control
+  publishRankings,
+  unpublishRankings,
+  resetRankingsVisibility,
+  // Student Bulk Upload
+  bulkUploadStudents,
+  validateStudentUpload,
+  downloadStudentTemplate,
+  exportStudents,
+  // Event Bulk Registration
+  validateBulkRegistration,
+  bulkRegisterStudents,
+  downloadEventRegistrationTemplate,
+  downloadGenericBulkRegistrationTemplate,
+  getAllBulkRegistrationLogs,
+  getBulkRegistrationLogs,
+  exportAllBulkRegistrationLogs,
+  exportBulkRegistrationLogs,
+  getPendingBulkRegistrations,
+  approveBulkRegistration,
+  rejectBulkRegistration,
+  updateEventCapacity,
 };

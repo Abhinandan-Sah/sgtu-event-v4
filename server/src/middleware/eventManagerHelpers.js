@@ -83,3 +83,49 @@ export const filterByEventId = (req, res, next) => {
   }
   next();
 };
+
+/**
+ * Validate event ownership for read-only operations
+ * Allows viewing completed/active events (not just draft)
+ * Skips validation for ADMIN role
+ * @middleware
+ */
+export const validateEventOwnershipForViewOnly = async (req, res, next) => {
+  try {
+    const { eventId } = req.params;
+    const managerId = req.user.id;
+    const userRole = req.user.role;
+    
+    // Skip validation for ADMIN role
+    if (userRole === 'ADMIN') {
+      return next();
+    }
+    
+    if (!eventId) {
+      return errorResponse(res, 'Event ID is required', 400);
+    }
+    
+    // Check if event exists and belongs to this manager
+    const eventQuery = 'SELECT * FROM events WHERE id = $1';
+    const eventResult = await query(eventQuery, [eventId]);
+    
+    if (eventResult.length === 0) {
+      return errorResponse(res, 'Event not found', 404);
+    }
+    
+    const event = eventResult[0];
+    
+    // Validate ownership (EVENT_MANAGER can only view their own events)
+    if (event.created_by_manager_id !== managerId) {
+      return errorResponse(res, 'Unauthorized: You can only view rankings for your own events', 403);
+    }
+    
+    // Attach event to request for downstream use if needed
+    req.managedEvent = event;
+    
+    next();
+  } catch (error) {
+    console.error('Event ownership validation error:', error);
+    return errorResponse(res, 'Error validating event ownership', 500);
+  }
+};

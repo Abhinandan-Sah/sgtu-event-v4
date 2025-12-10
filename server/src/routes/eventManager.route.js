@@ -3,14 +3,17 @@ import express from 'express';
 import EventManagerController from '../controllers/eventManager.controller.js';
 import StallController from '../controllers/stall.controller.js';
 import VolunteerController from '../controllers/volunteer.controller.js';
+import RankingController from '../controllers/ranking.controller.js';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 import { authLimiter, apiLimiter, eventCreationLimiter } from '../middleware/rateLimiter.js';
 import { sanitizeBody, sanitizeQuery } from '../middleware/sanitizer.js';
+import upload, { handleUploadErrors } from '../middleware/uploadExcel.js';
 import { 
   injectEventIdFromParams, 
   mapResourceIdToGenericId, 
   validateEventOwnership,
-  filterByEventId 
+  filterByEventId,
+  validateEventOwnershipForViewOnly
 } from '../middleware/eventManagerHelpers.js';
 
 const router = express.Router();
@@ -26,6 +29,20 @@ const router = express.Router();
  * @note    Event managers are created by admins only
  */
 router.post('/login', authLimiter, EventManagerController.login);
+
+/**
+ * @route   POST /api/event-manager/verify-identity
+ * @desc    Verify identity using phone + school_id (for password reset)
+ * @access  Public (with limited token)
+ */
+router.post('/verify-identity', authLimiter, authenticateToken, EventManagerController.verifyIdentity);
+
+/**
+ * @route   POST /api/event-manager/reset-password
+ * @desc    Reset password after identity verification
+ * @access  Public (with verified token)
+ */
+router.post('/reset-password', authLimiter, authenticateToken, EventManagerController.resetPassword);
 
 // ============================================================
 // PROTECTED ROUTES (Require authentication + EVENT_MANAGER role)
@@ -122,6 +139,60 @@ router.get('/events/:eventId/registrations', EventManagerController.getEventRegi
  * @access  Private (EVENT_MANAGER - owner only)
  */
 router.post('/events/:eventId/submit-for-approval', EventManagerController.submitEventForApproval);
+
+// ============================================================
+// EVENT BULK REGISTRATION ROUTES (RESTRICTED)
+// ============================================================
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/bulk-register/check-eligibility
+ * @desc    Check eligibility for bulk registration (rate limits, status, etc.)
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.get(
+  '/events/:eventId/bulk-register/check-eligibility',
+  EventManagerController.checkEligibility
+);
+
+/**
+ * @route   POST /api/event-manager/events/:eventId/bulk-register/validate
+ * @desc    Validate bulk registration file (pre-upload check)
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.post(
+  '/events/:eventId/bulk-register/validate',
+  upload.single('file'),
+  handleUploadErrors,
+  EventManagerController.validateBulkRegistration
+);
+
+/**
+ * @route   POST /api/event-manager/events/:eventId/bulk-register
+ * @desc    Bulk register students to event (with restrictions)
+ * @access  Private (EVENT_MANAGER - owner only)
+ * @restrictions 
+ *   - Only DRAFT/REJECTED events
+ *   - Only own events
+ *   - School-scoped students only
+ *   - >200 requires admin approval
+ *   - Rate limited: 15min cooldown, 20/day max
+ */
+router.post(
+  '/events/:eventId/bulk-register',
+  upload.single('file'),
+  handleUploadErrors,
+  EventManagerController.bulkRegisterStudents
+);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/bulk-register/template
+ * @desc    Download event registration template (event-specific)
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.get(
+  '/events/:eventId/bulk-register/template',
+  EventManagerController.downloadEventRegistrationTemplate
+);
 
 // ============================================================
 // ANALYTICS ROUTES
@@ -240,6 +311,50 @@ router.delete('/events/:eventId/volunteers/:volunteerId/delete',
   validateEventOwnership,
   mapResourceIdToGenericId('volunteerId'),
   VolunteerController.deleteVolunteer
+);
+
+// ============================================================
+// RANKING ROUTES (View Rankings for Own Events)
+// ============================================================
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/rankings/stalls
+ * @desc    Get stall rankings for own event
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.get('/events/:eventId/rankings/stalls',
+  validateEventOwnershipForViewOnly,
+  RankingController.getTopStallRankings
+);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/rankings/students
+ * @desc    Get student rankings for own event
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.get('/events/:eventId/rankings/students',
+  validateEventOwnershipForViewOnly,
+  RankingController.getTopStudentRankings
+);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/rankings/schools
+ * @desc    Get school rankings for own event
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.get('/events/:eventId/rankings/schools',
+  validateEventOwnershipForViewOnly,
+  RankingController.getTopSchools
+);
+
+/**
+ * @route   GET /api/event-manager/events/:eventId/rankings/all
+ * @desc    Get all ranking submissions for own event
+ * @access  Private (EVENT_MANAGER - owner only)
+ */
+router.get('/events/:eventId/rankings/all',
+  validateEventOwnershipForViewOnly,
+  RankingController.getAllRankings
 );
 
 export default router;

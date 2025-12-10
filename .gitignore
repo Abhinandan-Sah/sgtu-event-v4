@@ -89,6 +89,11 @@ tmp/
 temp/
 *.tmp
 
+# Development scripts (not for production)
+scripts-dev/
+*.xlsx
+*.xls
+
 # Deployment - exclude from production
 # server/src/tests/
 # server/src/seeders/

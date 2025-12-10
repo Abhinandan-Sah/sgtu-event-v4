@@ -36,8 +36,16 @@ import { getTokenFromCookie } from '../helpers/cookie.js';
  */
 export const authenticateToken = (req, res, next) => {
   try {
-    // Get token from HTTP-Only cookie only (more secure)
-    const token = getTokenFromCookie(req);
+    // Try to get token from HTTP-Only cookie first (more secure for browsers)
+    let token = getTokenFromCookie(req);
+    
+    // Fallback to Authorization header (for API clients, Postman, mobile apps)
+    if (!token) {
+      const authHeader = req.headers['authorization'];
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.substring(7); // Remove 'Bearer ' prefix
+      }
+    }
 
     if (!token) {
       return res.status(401).json({

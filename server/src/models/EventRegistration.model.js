@@ -57,15 +57,8 @@ class EventRegistration {
         [eventId, studentId]
       );
 
-      // Increment current_registrations
-      await pool(
-        `UPDATE events
-         SET current_registrations = current_registrations + 1,
-             total_registrations = total_registrations + 1,
-             updated_at = NOW()
-         WHERE id = $1`,
-        [eventId]
-      );
+      // Note: Event counters are automatically updated by database trigger
+      // See: update_event_registration_count() trigger in 005_add_multi_event_support.sql
 
       await pool('COMMIT');
       return result[0];
@@ -153,19 +146,9 @@ class EventRegistration {
         throw new Error('Registration not found or payment already completed');
       }
 
-      // Increment current_registrations and revenue after successful payment
-      await pool(
-        `UPDATE events e
-         SET current_registrations = current_registrations + 1,
-             total_registrations = total_registrations + 1,
-             total_paid_registrations = total_paid_registrations + 1,
-             total_revenue = total_revenue + er.payment_amount,
-             updated_at = NOW()
-         FROM event_registrations er
-         WHERE e.id = er.event_id
-           AND er.id = $1`,
-        [registrationId]
-      );
+      // Note: Event counters and revenue are automatically updated by database trigger
+      // See: update_event_registration_count() trigger in 005_add_multi_event_support.sql
+      // The trigger handles: current_registrations, total_registrations, total_paid_registrations, total_revenue
 
       await pool('COMMIT');
       return result[0];
@@ -515,6 +498,123 @@ class EventRegistration {
       WHERE id = ${registrationId}
     `;
     return true;
+  }
+
+  /**
+   * Bulk create event registrations (optimized with UNNEST)
+   * @param {Array} students - Array of student objects with {id, registration_no, full_name}
+   * @param {string} eventId - Event UUID
+   * @param {string} eventType - Event type (FREE or PAID)
+   * @param {Object} options - { skip_capacity_check: boolean }
+   * @returns {Promise<Object>} - { inserted: number, failed: number, errors: Array }
+   */
+  static async bulkCreate(students, eventId, eventType, options = {}) {
+    if (!students || students.length === 0) {
+      return {
+        success: true,
+        inserted: 0,
+        failed: 0,
+        duplicates: 0,
+        errors: []
+      };
+    }
+
+    let insertedCount = 0;
+    let duplicateCount = 0;
+    const errors = [];
+
+    try {
+      await pool('BEGIN');
+
+      // Lock event row to prevent concurrent capacity issues
+      const eventLock = await pool(
+        `SELECT id, max_capacity, current_registrations, event_type 
+         FROM events 
+         WHERE id = $1 
+         FOR UPDATE`,
+        [eventId]
+      );
+
+      if (eventLock.length === 0) {
+        throw new Error('Event not found');
+      }
+
+      const event = eventLock[0];
+
+      // Check capacity if not bypassed
+      if (!options.skip_capacity_check && event.max_capacity) {
+        const afterCount = event.current_registrations + students.length;
+        if (afterCount > event.max_capacity) {
+          await pool('ROLLBACK');
+          throw new Error(
+            `Capacity exceeded: Event capacity is ${event.max_capacity}, currently ${event.current_registrations}. Cannot add ${students.length} students.`
+          );
+        }
+      }
+
+      // Prepare data for bulk insert using UNNEST
+      const studentIds = students.map(s => s.id);
+      const paymentStatus = eventType === 'FREE' ? 'NOT_REQUIRED' : 'COMPLETED';
+      const registrationType = eventType === 'FREE' ? 'FREE' : 'PAID';
+
+      // Bulk insert with ON CONFLICT to handle duplicates
+      const result = await pool(
+        `INSERT INTO event_registrations (
+           event_id, 
+           student_id, 
+           registration_type, 
+           payment_status,
+           registration_status,
+           registered_at,
+           updated_at
+         )
+         SELECT 
+           $1::uuid as event_id,
+           unnest($2::uuid[]) as student_id,
+           $3::varchar as registration_type,
+           $4::varchar as payment_status,
+           'CONFIRMED'::varchar as registration_status,
+           NOW() as registered_at,
+           NOW() as updated_at
+         ON CONFLICT (event_id, student_id) DO NOTHING
+         RETURNING id, student_id`,
+        [eventId, studentIds, registrationType, paymentStatus]
+      );
+
+      insertedCount = result.length;
+      duplicateCount = students.length - insertedCount;
+
+      // Track which students were duplicates
+      const insertedStudentIds = new Set(result.map(r => r.student_id));
+      const duplicateStudents = students.filter(s => !insertedStudentIds.has(s.id));
+
+      // Add duplicate errors
+      duplicateStudents.forEach(student => {
+        errors.push({
+          registration_no: student.registration_no,
+          student_name: student.full_name,
+          error: 'ALREADY_REGISTERED',
+          message: 'Student is already registered for this event'
+        });
+      });
+
+      // Note: Event counters are automatically updated by database trigger
+      // See: update_event_registration_count() trigger in 005_add_multi_event_support.sql
+
+      await pool('COMMIT');
+
+      return {
+        success: true,
+        inserted: insertedCount,
+        failed: 0,
+        duplicates: duplicateCount,
+        total: students.length,
+        errors
+      };
+    } catch (error) {
+      await pool('ROLLBACK');
+      throw new Error(`Bulk registration failed: ${error.message}`);
+    }
   }
 }
 
