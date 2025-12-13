@@ -166,8 +166,8 @@ class EventManagerController {
     try {
       const { phone, school_id } = req.body;
 
-      if (!phone || !school_id) {
-        return errorResponse(res, 'Phone number and school ID are required for verification', 400);
+      if (!phone) {
+        return errorResponse(res, 'Phone number is required for verification', 400);
       }
 
       // Get event manager
@@ -181,9 +181,17 @@ class EventManagerController {
         return errorResponse(res, 'Phone number does not match our records', 401);
       }
 
-      // Verify school_id matches
-      if (manager.school_id !== school_id) {
-        return errorResponse(res, 'School does not match our records', 401);
+      // Verify school_id matches (only if manager has school_id)
+      if (manager.school_id) {
+        if (!school_id) {
+          return errorResponse(res, 'School ID is required for verification', 400);
+        }
+        if (manager.school_id !== school_id) {
+          return errorResponse(res, 'School does not match our records', 401);
+        }
+      } else {
+        // Legacy manager without school_id - only verify phone
+        console.log(`⚠️ Legacy event manager ${manager.id} verified with phone only (no school_id)`);
       }
 
       // Issue full access token after verification
