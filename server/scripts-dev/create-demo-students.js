@@ -12,8 +12,8 @@ const __dirname = path.dirname(__filename);
  * Generate demo student data Excel file for testing bulk upload
  */
 
-// Fetch real school IDs from database
-async function fetchSchoolIds() {
+// Fetch real school IDs from database with their names
+async function fetchSchoolsWithPrograms() {
   try {
     const schools = await query('SELECT id, school_name FROM schools ORDER BY school_name');
     if (schools.length === 0) {
@@ -22,10 +22,57 @@ async function fetchSchoolIds() {
       process.exit(1);
     }
     console.log(`✅ Found ${schools.length} schools in database`);
-    schools.forEach(school => {
-      console.log(`   - ${school.school_name} (${school.id})`);
+    
+    // Map schools to their appropriate programs
+    const schoolProgramMap = schools.map(school => {
+      let programs = [];
+      
+      switch(school.school_name) {
+        case 'School of Computer Science and Engineering':
+          programs = ['B.Tech Computer Science', 'BCA', 'MCA', 'B.Tech Information Technology'];
+          break;
+        case 'School of Civil Engineering':
+          programs = ['B.Tech Civil Engineering', 'Diploma Civil Engineering'];
+          break;
+        case 'School of Mechanical Engineering':
+          programs = ['B.Tech Mechanical Engineering', 'Diploma Mechanical Engineering'];
+          break;
+        case 'School of Electrical Engineering':
+          programs = ['B.Tech Electrical Engineering', 'Diploma Electrical Engineering', 'B.Tech Electronics'];
+          break;
+        case 'School of Biotechnology':
+          programs = ['B.Tech Biotechnology', 'MSc Biotechnology', 'BSc Biotechnology'];
+          break;
+        case 'School of Management':
+          programs = ['MBA', 'BBA', 'B.Com', 'BA Economics'];
+          break;
+        case 'School of Applied Sciences':
+          programs = ['BSc Physics', 'BSc Chemistry', 'BSc Mathematics', 'BSc Agriculture'];
+          break;
+        case 'School of Pharmacy':
+          programs = ['B.Pharm', 'D.Pharm', 'M.Pharm'];
+          break;
+        case 'School of Fashion Designing':
+          programs = ['Fashion Design', 'Textile Design', 'Fashion Technology'];
+          break;
+        case 'School of Physical Education':
+          programs = ['B.P.Ed', 'Sports Management', 'Sports Science'];
+          break;
+        default:
+          // Unknown school - log warning and use generic programs
+          console.warn(`   ⚠️  WARNING: Unknown school "${school.school_name}" - using generic programs`);
+          programs = ['General Studies', 'Miscellaneous'];
+      }
+      
+      console.log(`   - ${school.school_name} (${school.id}) - ${programs.length} programs`);
+      return {
+        id: school.id,
+        name: school.school_name,
+        programs: programs
+      };
     });
-    return schools.map(s => s.id);
+    
+    return schoolProgramMap;
   } catch (error) {
     console.error('❌ Error fetching schools:', error.message);
     console.log('Make sure your database is running and configured correctly.');
@@ -33,123 +80,84 @@ async function fetchSchoolIds() {
   }
 }
 
-// Sample data generators
+// Deterministic data arrays for mapped generation
 const firstNames = ['Rahul', 'Priya', 'Amit', 'Sneha', 'Rohan', 'Anjali', 'Vikram', 'Pooja', 'Arjun', 'Neha', 'Karan', 'Divya', 'Aditya', 'Riya', 'Sanjay', 'Kavya', 'Manish', 'Shreya', 'Nikhil', 'Isha'];
 const lastNames = ['Sharma', 'Patel', 'Kumar', 'Singh', 'Verma', 'Gupta', 'Reddy', 'Jain', 'Agarwal', 'Rao', 'Desai', 'Mehta', 'Nair', 'Iyer', 'Malhotra', 'Chopra', 'Bhatia', 'Kapoor', 'Pandey', 'Joshi'];
-const programs = ['B.Tech Computer Science', 'B.Tech Electronics', 'B.Tech Mechanical', 'B.Tech Civil', 'BBA', 'BCA', 'B.Com', 'BA Economics', 'B.Sc Mathematics', 'B.Sc Physics'];
 const cities = ['Delhi', 'Mumbai', 'Bangalore', 'Hyderabad', 'Chennai', 'Kolkata', 'Pune', 'Ahmedabad', 'Jaipur', 'Lucknow'];
 const batches = [2024, 2025, 2026, 2027];
 
-// Generate random data
-const getRandomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
-const getRandomDate = (start, end) => new Date(start.getTime() + Math.random() * (end.getTime() - start.getTime()));
-const getRandomPincode = () => Math.floor(100000 + Math.random() * 900000).toString();
-const getRandomPhone = () => '9' + Math.floor(100000000 + Math.random() * 900000000).toString();
+// Deterministic data generators (no randomness - all mapped)
+const getMappedItem = (arr, index) => arr[index % arr.length];
+const getMappedDate = (baseYear, dayOffset) => {
+  const year = baseYear - (dayOffset % 8) - 18; // Ages 18-25
+  const month = (dayOffset % 12) + 1;
+  const day = (dayOffset % 28) + 1;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+};
+const getMappedPincode = (index) => String(110001 + (index % 900000)).padStart(6, '0');
+const getMappedPhone = (index) => '9' + String(100000000 + (index % 900000000)).padStart(9, '0');
 
-// Generate demo students
-function generateDemoStudents(count, schoolIds) {
+// Generate demo students with deterministic mapped data
+function generateDemoStudents(count, schoolProgramMap) {
   const students = [];
   const currentYear = new Date().getFullYear();
   
-  for (let i = 1; i <= count; i++) {
-    const firstName = getRandomItem(firstNames);
-    const lastName = getRandomItem(lastNames);
-    const fullName = `${firstName} ${lastName}`;
-    const regNo = `2025${String(i).padStart(4, '0')}`;
-    const email = `${firstName.toLowerCase()}.${lastName.toLowerCase()}${i}@student.sgtu.ac.in`;
-    const city = getRandomItem(cities);
+  // Calculate students per school for even distribution
+  const studentsPerSchool = Math.floor(count / schoolProgramMap.length);
+  const remainder = count % schoolProgramMap.length;
+  
+  let studentIndex = 0;
+  
+  // Distribute students evenly across schools
+  schoolProgramMap.forEach((school, schoolIndex) => {
+    const studentsForThisSchool = studentsPerSchool + (schoolIndex < remainder ? 1 : 0);
+    const programsCount = school.programs.length;
+    const studentsPerProgram = Math.ceil(studentsForThisSchool / programsCount);
     
-    // Generate DOB (18-25 years old)
-    const minDate = new Date(currentYear - 25, 0, 1);
-    const maxDate = new Date(currentYear - 18, 11, 31);
-    const dob = getRandomDate(minDate, maxDate).toISOString().split('T')[0];
-    
-    students.push({
-      registration_no: regNo,
-      email: email,
-      full_name: fullName,
-      school_id: getRandomItem(schoolIds), // Use real school IDs from database
-      date_of_birth: dob, // Required for password generation
-      pincode: getRandomPincode(), // Required for password generation
-      phone: getRandomPhone(),
-      address: `${Math.floor(Math.random() * 999) + 1}, Sector ${Math.floor(Math.random() * 50) + 1}, ${city}, India`,
-      program_name: getRandomItem(programs),
-      batch: getRandomItem(batches),
-    });
-  }
+    // Assign students to programs in this school
+    for (let i = 0; i < studentsForThisSchool; i++) {
+      const programIndex = Math.floor(i / studentsPerProgram);
+      const selectedProgram = school.programs[Math.min(programIndex, programsCount - 1)];
+      
+      const firstName = getMappedItem(firstNames, studentIndex);
+      const lastName = getMappedItem(lastNames, studentIndex);
+      const fullName = `${firstName} ${lastName}`;
+      const regNo = `2025${String(studentIndex + 1).padStart(4, '0')}`;
+      const email = `${firstName.toLowerCase()}.${lastName.toLowerCase()}${studentIndex + 1}@student.sgtu.ac.in`;
+      const city = getMappedItem(cities, studentIndex);
+      const dob = getMappedDate(currentYear, studentIndex);
+      const batch = getMappedItem(batches, studentIndex);
+      
+      students.push({
+        registration_no: regNo,
+        email: email,
+        full_name: fullName,
+        school_id: school.id,
+        date_of_birth: dob,
+        pincode: getMappedPincode(studentIndex),
+        phone: getMappedPhone(studentIndex),
+        address: `${(studentIndex % 999) + 1}, Sector ${(studentIndex % 50) + 1}, ${city}, India`,
+        program_name: selectedProgram,
+        batch: batch,
+      });
+      
+      studentIndex++;
+    }
+  });
   
   return students;
 }
 
-// Create Excel file
-async function createDemoExcel(studentCount = 50) {
-  console.log(`🔨 Generating ${studentCount} demo students with real school IDs...\n`);
+// Create Excel file with demo students
+async function createDemoExcel(studentCount) {
+  console.log(`\n🚀 Generating ${studentCount} demo students with correct school-program mapping...\n`);
   
-  // Fetch real school IDs from database
-  const schoolIds = await fetchSchoolIds();
+  // Fetch real schools with their programs from database
+  const schoolProgramMap = await fetchSchoolsWithPrograms();
   console.log('');
   
-  const students = generateDemoStudents(studentCount, schoolIds);
+  const students = generateDemoStudents(studentCount, schoolProgramMap);
   const workbook = new ExcelJS.Workbook();
-  
-  // Create Instructions sheet
-  const instructionsSheet = workbook.addWorksheet('📋 Instructions');
-  instructionsSheet.columns = [{ key: 'content', width: 80 }];
-  
-  instructionsSheet.addRows([
-    ['DEMO STUDENT DATA - READY FOR BULK UPLOAD'],
-    [''],
-    ['✅ This file contains REAL school IDs from your database'],
-    ['✅ All data is valid and ready to upload'],
-    ['✅ Registration numbers are unique'],
-    ['✅ Email addresses are unique'],
-    ['✅ DOB and pincode included for password auto-generation'],
-    [''],
-    ['⚠️ PASSWORD AUTO-GENERATION:'],
-    ['Passwords are AUTO-GENERATED from date_of_birth + pincode'],
-    ['Example: DOB 2005-05-15 + Pincode 110001 = Password "20050515110001"'],
-    ['Students will be required to reset password on first login'],
-    [''],
-    ['📋 Field Information:'],
-    ['* registration_no: Unique student registration number'],
-    ['  email: Student email address (optional but unique if provided)'],
-    ['* full_name: Student full name'],
-    ['* school_id: Valid UUID from your schools table'],
-    ['* date_of_birth: Birth date YYYY-MM-DD - REQUIRED for password'],
-    ['* pincode: 6-digit postal code - REQUIRED for password'],
-    ['  phone: 10-digit phone number (optional)'],
-    ['  address: Full address (optional)'],
-    ['  program_name: Course/Program name (optional)'],
-    ['  batch: Graduation year (optional)'],
-    [''],
-    ['🚀 How to Upload:'],
-    [''],
-    ['1. VALIDATE FIRST (Recommended):'],
-    ['   POST /api/admin/students/validate-upload'],
-    ['   - Upload this file'],
-    ['   - Check for any errors'],
-    ['   - Fix if needed'],
-    [''],
-    ['2. BULK UPLOAD:'],
-    ['   POST /api/admin/students/bulk-upload'],
-    ['   - Upload this file'],
-    ['   - Wait for completion (~15-20 seconds for 100 records)'],
-    ['   - Check response for success/failure details'],
-    [''],
-    ['💡 Tips:'],
-    ['- You can modify any data before uploading'],
-    ['- Keep registration_no and email unique'],
-    ['- School IDs are already valid'],
-    ['- Test with validate route first to catch errors early'],
-    [''],
-    ['📊 This file contains ' + studentCount + ' demo student records'],
-  ]);
-  
-  instructionsSheet.getRow(1).font = { bold: true, size: 14, color: { argb: 'FF0066CC' } };
-  instructionsSheet.getRow(3).font = { bold: true, size: 11, color: { argb: 'FF008000' } };
-  instructionsSheet.getRow(9).font = { bold: true, size: 12 };
-  instructionsSheet.getRow(23).font = { bold: true, size: 12 };
-  instructionsSheet.getRow(37).font = { bold: true, size: 12 };
   
   // Create Students sheet
   const studentsSheet = workbook.addWorksheet('Students');
@@ -212,8 +220,9 @@ async function createDemoExcel(studentCount = 50) {
   console.log(`📁 File: ${fileName}`);
   console.log(`📍 Location: ${filePath}`);
   console.log(`📊 Records: ${studentCount} students`);
-  console.log(`🏫 Schools: Distributed across ${schoolIds.length} real schools`);
+  console.log(`🏫 Schools: Distributed across ${schoolProgramMap.length} real schools`);
   console.log('');
+  console.log('✅ School-Program mapping is CORRECT!');
   console.log('✅ School IDs are VALID - Ready to upload immediately!');
   console.log('');
   console.log('🧪 Next Steps:');

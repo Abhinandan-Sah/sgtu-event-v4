@@ -60,10 +60,13 @@ class FeedbackModel {
       SELECT f.*,
         st.stall_name,
         st.stall_number,
-        sc.school_name
+        sc.school_name,
+        e.event_name,
+        e.event_code
       FROM feedbacks f
       LEFT JOIN stalls st ON f.stall_id = st.id
       LEFT JOIN schools sc ON st.school_id = sc.id
+      LEFT JOIN events e ON f.event_id = e.id
       WHERE f.student_id = $1
       ORDER BY f.submitted_at DESC
     `;

@@ -454,7 +454,9 @@ const getMyVisits = async (req, res, next) => {
         rating: f.rating,
         comment: f.comment,
         visited_at: f.submitted_at,
-        event_id: f.event_id
+        event_id: f.event_id,
+        event_name: f.event_name,
+        event_code: f.event_code
       }))
     });
   } catch (error) {

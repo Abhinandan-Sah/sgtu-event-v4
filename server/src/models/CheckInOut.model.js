@@ -41,10 +41,14 @@ class CheckInOutModel {
         c.*,
         s.full_name as student_name,
         s.registration_no,
-        v.full_name as volunteer_name
+        v.full_name as volunteer_name,
+        e.event_name,
+        e.event_code,
+        e.event_type
       FROM check_in_outs c
       LEFT JOIN students s ON c.student_id = s.id
       LEFT JOIN volunteers v ON c.volunteer_id = v.id
+      LEFT JOIN events e ON c.event_id = e.id
       WHERE c.student_id = $1
       ORDER BY c.scanned_at DESC
     `;
